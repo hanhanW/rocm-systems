@@ -396,8 +396,14 @@ class LlamaRuntime:
     libraries: dict[str, Path]
 
 
-def _llama_runtime_files(build_root: Path) -> dict[str, Path]:
-    source_root = build_root / "third_party" / "llama.cpp" / "ggml" / "src"
+def _llama_runtime_files(
+    build_root: Path, *, backend_ops: bool = False
+) -> dict[str, Path]:
+    source_root = (
+        build_root / "ggml" / "src"
+        if backend_ops
+        else build_root / "third_party" / "llama.cpp" / "ggml" / "src"
+    )
     return {
         "ggml": source_root / "libggml.so",
         "ggml-base": source_root / "libggml-base.so",
@@ -408,8 +414,11 @@ def _llama_runtime_files(build_root: Path) -> dict[str, Path]:
 
 def _llama_runtime(workspace: Path, target: str, name: str) -> LlamaRuntime:
     configured = os.environ.get(LLAMA_BUILD_DIR_ENV)
+    backend_ops = name == "test-backend-ops"
     if configured:
         build_roots = (Path(os.path.abspath(Path(configured).expanduser())),)
+    elif backend_ops:
+        build_roots = (workspace / "rocjitsu-test-corpus-build" / f"llama-{target}",)
     else:
         build_roots = (
             workspace / "rocjitsu-test-corpus-build" / "kernels" / target,
@@ -425,8 +434,12 @@ def _llama_runtime(workspace: Path, target: str, name: str) -> LlamaRuntime:
 
     failures = []
     for build_root in build_roots:
-        executable = build_root / "cases" / "llama.cpp" / name
-        libraries = _llama_runtime_files(build_root)
+        executable = (
+            build_root / name
+            if backend_ops
+            else build_root / "cases" / "llama.cpp" / name
+        )
+        libraries = _llama_runtime_files(build_root, backend_ops=backend_ops)
         missing = [
             path for path in (executable, *libraries.values()) if not path.is_file()
         ]
@@ -483,12 +496,26 @@ def _input_files(workspace: Path, target: str, workload: Workload) -> dict[str, 
             "amdclang++": paths.rocm / "bin" / "amdclang++",
         }
     if workload.kind == "llama":
+        runtime = _llama_runtime(workspace, target, workload.relative_path)
+        if workload.relative_path == "test-backend-ops":
+            corpus = workspace / "rocjitsu-test-corpus" / "corpus" / "llama"
+            return {
+                "python": Path(os.path.abspath(Path(sys.executable).expanduser())),
+                "workload-source": Path(__file__).with_name(
+                    "consan_llama_validation.py"
+                ),
+                "case": corpus / "selected_llama_backend_ops_tests.json",
+                "harness-source": corpus
+                / "third_party/llama.cpp/tests/test-backend-ops.cpp",
+                "source-pin": corpus / "third_party/llama.cpp/NOTICE.md",
+                "executable": runtime.executable,
+                **runtime.libraries,
+            }
         case = (
             "mul_mat_vec_q"
             if workload.id == "llama-rdna4-mul-mat-vec-q"
             else "rms_norm"
         )
-        runtime = _llama_runtime(workspace, target, workload.relative_path)
         return {
             "python": Path(os.path.abspath(Path(sys.executable).expanduser())),
             "workload-source": Path(__file__).with_name("consan_llama_validation.py"),
@@ -1404,6 +1431,17 @@ def _workload_command(
             )
         return command
     if workload.kind == "llama":
+        if workload.relative_path == "test-backend-ops":
+            return [
+                sys.executable,
+                str(Path(__file__).with_name("consan_llama_validation.py")),
+                "--executable",
+                str(_llama_executable(workspace, target, workload.relative_path)),
+                "--backend-op-case",
+                workload.llama_backend_op_case,
+                "--output-dir",
+                str(output.parent / f"{output.stem}-llama-work"),
+            ]
         llama_workload = (
             "mul-mat-vec-q"
             if workload.id == "llama-rdna4-mul-mat-vec-q"

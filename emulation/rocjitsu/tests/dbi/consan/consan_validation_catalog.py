@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 import math
 from pathlib import Path
+import re
 
 import consan_cdna_hip_registry as cdna_hip_registry
 
@@ -196,6 +197,7 @@ class Workload:
     tensile_streamk_mode: int | None = None
     tensile_minimum_timed_ms: float = EMPIRICAL_MINIMUM_TIMED_MS
     self_timed_device_minimum_ms: float | None = None
+    llama_backend_op_case: str | None = None
     warm_timing_mode: str | None = None
     empirical_device_timed_minimum_ms: float | None = None
     device_timing_max_iterations: int | None = None
@@ -759,7 +761,7 @@ WORKLOADS = (
         tracks_atomics=False,
         overhead_processes=1,
         fault_families=("barrier-drop",),
-        targets=("gfx950", "gfx1250"),
+        targets=("gfx950", "gfx1100", "gfx1250"),
     ),
     Workload(
         id="pytorch-torch-sort",
@@ -814,7 +816,7 @@ WORKLOADS = (
         # installed wheel.  The gfx1201 wheel chooses a native histogram
         # kernel with LDS accesses, split barriers, and LDS atomics; target
         # evidence and qualification remain separate.
-        targets=("gfx950", "gfx1250", "gfx1201"),
+        targets=("gfx950", "gfx1100", "gfx1250", "gfx1201"),
     ),
     Workload(
         id="pytorch-norm-softmax",
@@ -924,6 +926,57 @@ WORKLOADS = (
         # Allowlisted host preparation/patching takes 114–145s on gfx1201.
         run_timeout_seconds=300,
         self_timed_device_minimum_ms=EMPIRICAL_MINIMUM_TIMED_MS,
+    ),
+    Workload(
+        id="llama-rms-norm",
+        priority="P1",
+        corpus="rocjitsu-test-corpus",
+        kind="llama",
+        relative_path="test-backend-ops",
+        clean_filter=None,
+        overhead_filter=None,
+        sharktank_workload=None,
+        sharktank_mode=None,
+        tracks_barriers=True,
+        tracks_atomics=False,
+        overhead_processes=1,
+        fault_families=("barrier-drop",),
+        llama_backend_op_case="RMS_NORM(type=f32,ne=[1025,5,4,3],v=1,eps=0.000001,inplace=0)",
+        targets=("gfx1100",),
+    ),
+    Workload(
+        id="llama-softmax",
+        priority="P1",
+        corpus="rocjitsu-test-corpus",
+        kind="llama",
+        relative_path="test-backend-ops",
+        clean_filter=None,
+        overhead_filter=None,
+        sharktank_workload=None,
+        sharktank_mode=None,
+        tracks_barriers=True,
+        tracks_atomics=False,
+        overhead_processes=1,
+        fault_families=("barrier-drop",),
+        llama_backend_op_case="SOFT_MAX(type=f32,ne=[1024,16,1,1],mask=0,sinks=0,m_prec=f32,nr23=[1,1],scale=0.100000,max_bias=0.000000,inplace=0)",
+        targets=("gfx1100",),
+    ),
+    Workload(
+        id="llama-mul-mat-q4",
+        priority="P1",
+        corpus="rocjitsu-test-corpus",
+        kind="llama",
+        relative_path="test-backend-ops",
+        clean_filter=None,
+        overhead_filter=None,
+        sharktank_workload=None,
+        sharktank_mode=None,
+        tracks_barriers=True,
+        tracks_atomics=False,
+        overhead_processes=1,
+        fault_families=("barrier-drop",),
+        llama_backend_op_case="MUL_MAT(type_a=q4_0,type_b=f32,m=16,n=9,k=256,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1)",
+        targets=("gfx1100",),
     ),
     Workload(
         id="llama-rdna4-mul-mat-vec-q",
@@ -1293,6 +1346,17 @@ def _validate_tensile_sharding(workload: Workload) -> None:
 def _validate_workload_manifest() -> None:
     for workload in WORKLOADS:
         _validate_tensile_sharding(workload)
+        if (
+            workload.llama_backend_op_case is not None
+            or workload.relative_path == "test-backend-ops"
+        ) and (
+            workload.kind != "llama"
+            or workload.relative_path != "test-backend-ops"
+            or workload.llama_backend_op_case is None
+            or re.fullmatch(r"[A-Z][A-Z0-9_]*\(.*\)", workload.llama_backend_op_case)
+            is None
+        ):
+            raise RuntimeError(f"{workload.id} has an invalid backend-op case")
         if any(
             not name
             or not isinstance(value, str)

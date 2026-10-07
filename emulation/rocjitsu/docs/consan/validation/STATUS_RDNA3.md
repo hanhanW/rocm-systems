@@ -233,6 +233,11 @@ for this execution target; simulator prerequisites alone do not qualify hardware
 | Broad E2E | P0 | PyTorch mode (`pytorch-torch-mode`) | 🟩 high: clean pass; access 244/244, barrier 51/51; selected publication fault detected and reached 8/8; standard preset unassessed | 🟨 clean pass; access 244/244; fault sensitivity unassessed |
 | Broad E2E | P0 | PyTorch sort (`pytorch-torch-sort`) | 🟩 high: clean pass; access 234/234, barrier 40/40; selected publication fault detected and reached 8/8; standard preset unassessed | 🟨 clean pass; access 234/234; fault sensitivity unassessed |
 | Broad E2E | P0 | PyTorch norm/softmax (`pytorch-norm-softmax`) | 🟨 combined clean pass; access 22/22, barrier 15/15. Component fault trials: softmax high 8/8 detected/reached; norm high 2/8, higher 5/8, max 5/8 diagnostics with miss reach unproved; combined row below bar | 🟨 combined clean pass; access 22/22; fault sensitivity unassessed |
+| Broad E2E | P1 | PyTorch top-k (`pytorch-torch-topk`) | 🟩 `high`: clean pass; access 457/457, barrier 97/97; BF16 publication fault 8/8, all reached | 🩶 deferred |
+| Broad E2E | P1 | PyTorch histogram (`pytorch-torch-histc`) | 🟩 higher + 256 banks: clean pass; access 7/7, barrier 4/4; FP32 fault 6/8 and FP64 8/8, all admitted/reached | 🩶 deferred |
+| Broad E2E | P1 | llama.cpp RMS norm (`llama-rms-norm`) | 🟩 max: clean pass; access 2/2, barrier 1/1; fault 6/8, all reached | 🩶 deferred |
+| Broad E2E | P1 | llama.cpp softmax (`llama-softmax`) | 🟥 Known workload scratch-reuse race, [fixed upstream](https://github.com/ggml-org/llama.cpp/pull/26385) but absent from the corpus pin. `high`: eight read/write conflicts without fault injection; access 8/8, barrier 2/2. Backport and validation deferred to next round. | 🩶 deferred |
+| Broad E2E | P1 | llama.cpp Q4 matmul (`llama-mul-mat-q4`) | 🟥 return-proof repair admits transformation; high clean reports 33 write/write conflicts, access 102/102, barrier 6/6; input investigation deferred to next round | 🩶 deferred |
 | Broad E2E | P1 | Sharktank TP1 prefill (`tp1-prefill`) | 🩶 unassessed | 🩶 unassessed |
 | Broad E2E | P1 | Sharktank TP1 decode/combined (`tp1-decode-combined`) | 🩶 unassessed | 🩶 unassessed |
 | Broad E2E | P2 | Sharktank TP2 family (`tp2-family`) | 🩶 unassessed | 🩶 unassessed |

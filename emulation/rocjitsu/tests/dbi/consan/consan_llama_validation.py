@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import math
 import os
@@ -117,16 +118,80 @@ def _gpu_timing(output: str, expected_iterations: int) -> tuple[float, float]:
     return aggregate_ms, per_iteration_ms
 
 
+def _parse_backend_op_result(output: str, case: str) -> dict[str, str]:
+    records = list(
+        csv.reader(
+            (line for line in output.splitlines() if line.startswith('"')), strict=True
+        )
+    )
+    if len(records) != 2 or len(records[0]) != len(set(records[0])):
+        raise ValueError("expected one backend-op CSV header and one result")
+    header, values = records
+    if len(values) != len(header):
+        raise ValueError("malformed backend-op CSV result")
+    row = dict(zip(header, values))
+    expected = {
+        "backend_name": "ROCm0",
+        "test_mode": "test",
+        "supported": "1",
+        "error_message": "",
+    }
+    if any(row.get(key) != value for key, value in expected.items()):
+        raise ValueError(f"backend-op comparison did not pass: {row}")
+    if f"{row.get('op_name')}({row.get('op_params')})" != case:
+        raise ValueError(f"backend-op result does not match the exact case: {row}")
+    return row
+
+
+def _run_backend_op(executable: Path, case: str) -> int:
+    returncode, elapsed_ms, output = _run(
+        [str(executable), "test", "-o", case, "-b", "ROCm0", "--output", "csv"]
+    )
+    passed = False
+    try:
+        detail = _parse_backend_op_result(output, case)
+        passed = returncode == 0
+    except (ValueError, csv.Error) as error:
+        detail = str(error)
+    result = {
+        "llama-backend-op": {
+            "case": case,
+            "oracle": "independent-ggml-cpu-backend",
+            "oracle_passed": passed,
+            "returncode": returncode,
+            "detail": detail,
+            "process_elapsed_ms": elapsed_ms,
+        }
+    }
+    _write_oracle_result("pass" if passed else "fail", result)
+    print(json.dumps(result, sort_keys=True))
+    return 0 if passed else 1
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--executable", type=Path, required=True)
-    parser.add_argument("--workload", choices=tuple(WORKLOADS), required=True)
+    selection = parser.add_mutually_exclusive_group(required=True)
+    selection.add_argument("--workload", choices=tuple(WORKLOADS))
+    selection.add_argument("--backend-op-case")
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--n-embd", type=int)
     parser.add_argument("--benchmark-iterations", type=int)
     parser.add_argument("--benchmark-warmup-iterations", type=int, default=5)
     parser.add_argument("--minimum-timed-ms", type=float, default=0.0)
     args = parser.parse_args(argv)
+    if args.backend_op_case is not None:
+        if re.fullmatch(r"[A-Z][A-Z0-9_]*\(.*\)", args.backend_op_case) is None:
+            parser.error("--backend-op-case requires one exact OP(params) case")
+        if (
+            args.n_embd is not None
+            or args.benchmark_iterations is not None
+            or args.minimum_timed_ms != 0.0
+        ):
+            parser.error(
+                "backend-op correctness does not support standalone timing options"
+            )
+        return _run_backend_op(args.executable, args.backend_op_case)
     if args.n_embd is not None and args.n_embd <= 0:
         parser.error("--n-embd must be positive")
     if args.benchmark_iterations is not None and args.benchmark_iterations <= 0:

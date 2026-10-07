@@ -607,14 +607,16 @@ class ConSanValidationTest(unittest.TestCase):
         self.assertNotIn("pytorch-rdna4-sdpa", workloads)
         self.assertEqual(
             workloads["pytorch-torch-histc"]["targets"],
-            ("gfx950", "gfx1250", "gfx1201"),
+            ("gfx950", "gfx1100", "gfx1250", "gfx1201"),
         )
         self.assertEqual(
             workloads["llama-rdna4-mul-mat-vec-q"]["targets"], ("gfx1201",)
         )
         self.assertEqual(workloads["llama-rdna4-rms-norm"]["targets"], ("gfx1201",))
 
-    def test_status_ledgers_are_single_tables_matching_manifests(self) -> None:
+    def test_status_ledgers_have_one_qualification_table_matching_manifests(
+        self,
+    ) -> None:
         status_root = (
             Path(validation.__file__).resolve().parents[3] / "docs/consan/validation"
         )
@@ -636,9 +638,11 @@ class ConSanValidationTest(unittest.TestCase):
                 self.assertIn("VALIDATION.md#status-colors", introduction)
                 for color in ("🟥", "🟧", "🟨", "🟩"):
                     self.assertIn(color, introduction)
+                # Narrative tables may precede the qualification ledger.
+                ledger = status[status.index("| Set |") :].split("\n\n", 1)[0]
                 rows = [
                     line
-                    for line in status.splitlines()
+                    for line in ledger.splitlines()
                     if line.startswith("| ")
                     and not line.startswith("| Set |")
                     and not line.startswith("| ---")

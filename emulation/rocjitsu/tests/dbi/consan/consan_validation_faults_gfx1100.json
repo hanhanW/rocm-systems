@@ -1241,6 +1241,255 @@
           }
         }
       ]
+    },
+    "llama-rms-norm": {
+      "faults": [
+        {
+          "id": "drop-rms-partial-sum-publication-high",
+          "family": "barrier-drop",
+          "reach_witness": {
+            "kind": "reviewed-unconditional-final-isa",
+            "evidence": "The exact RMS_NORM backend case dispatches 256 threads per workgroup. Each wave publishes its partial sum, then an unconditional workgroup barrier separates those stores from peer-wave loads in block_reduce. The pristine target ISA confirms the store, EXEC reconvergence, completion wait, singleton barrier and following load. Remove only that publication barrier; preserve the completion wait. Default/high uses eight predeclared trials with a six-detection threshold and a matching strict clean comparator. Mutation admission, runtime reach, complete evidence and healthy pre/post probes are required; numerical failure alone is not detection."
+          },
+          "environment": {
+            "RJ_CONSAN_FAULT_DROP_BARRIER": "1",
+            "RJ_CONSAN_FAULT_SITE_IDENTITY": "fnv1a64:408e676315a92a89|kernel=_ZL12rms_norm_f32ILi256ELb0ELb0EEvPKfPfilllfS1_lll15HIP_vector_typeIjLj3EES4_S4_S4_S1_lllS4_S4_S4_S4_|kind=barrier|pc=0x000000000000144c|mnemonic=s_barrier|occurrence=0"
+          },
+          "profiles": {
+            "default": {
+              "detector": "statistical",
+              "minimum_detections": 6,
+              "oracle": "any",
+              "trials": [
+                {
+                  "RJ_CONSAN_PRESET": "high"
+                },
+                {
+                  "RJ_CONSAN_PRESET": "high"
+                },
+                {
+                  "RJ_CONSAN_PRESET": "high"
+                },
+                {
+                  "RJ_CONSAN_PRESET": "high"
+                },
+                {
+                  "RJ_CONSAN_PRESET": "high"
+                },
+                {
+                  "RJ_CONSAN_PRESET": "high"
+                },
+                {
+                  "RJ_CONSAN_PRESET": "high"
+                },
+                {
+                  "RJ_CONSAN_PRESET": "high"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "id": "drop-rms-partial-sum-publication-max",
+          "family": "barrier-drop",
+          "reach_witness": {
+            "kind": "reviewed-unconditional-final-isa",
+            "evidence": "The exact RMS_NORM backend case dispatches 256 threads per workgroup. Each wave publishes its partial sum, then an unconditional workgroup barrier separates those stores from peer-wave loads in block_reduce. The pristine target ISA confirms the store, EXEC reconvergence, completion wait, singleton barrier and following load. Remove only that publication barrier; preserve the completion wait. Default/max uses eight predeclared trials with a six-detection threshold and a matching strict clean comparator. Mutation admission, runtime reach, complete evidence and healthy pre/post probes are required; numerical failure alone is not detection."
+          },
+          "environment": {
+            "RJ_CONSAN_FAULT_DROP_BARRIER": "1",
+            "RJ_CONSAN_FAULT_SITE_IDENTITY": "fnv1a64:408e676315a92a89|kernel=_ZL12rms_norm_f32ILi256ELb0ELb0EEvPKfPfilllfS1_lll15HIP_vector_typeIjLj3EES4_S4_S4_S1_lllS4_S4_S4_S4_|kind=barrier|pc=0x000000000000144c|mnemonic=s_barrier|occurrence=0"
+          },
+          "profiles": {
+            "default": {
+              "detector": "statistical",
+              "minimum_detections": 6,
+              "oracle": "any",
+              "trials": [
+                {
+                  "RJ_CONSAN_PRESET": "max"
+                },
+                {
+                  "RJ_CONSAN_PRESET": "max"
+                },
+                {
+                  "RJ_CONSAN_PRESET": "max"
+                },
+                {
+                  "RJ_CONSAN_PRESET": "max"
+                },
+                {
+                  "RJ_CONSAN_PRESET": "max"
+                },
+                {
+                  "RJ_CONSAN_PRESET": "max"
+                },
+                {
+                  "RJ_CONSAN_PRESET": "max"
+                },
+                {
+                  "RJ_CONSAN_PRESET": "max"
+                }
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "pytorch-torch-histc": {
+      "faults": [
+        {
+          "id": "drop-histogram-fp32-initialization-higher-256",
+          "family": "barrier-drop",
+          "reach_witness": {
+            "kind": "reviewed-unconditional-final-isa",
+            "evidence": "The exact histogram case dispatches two 512-thread workgroups per dtype. Cooperative initialization stores are followed by EXEC reconvergence, a completion wait and an unconditional singleton barrier before atomic bin accumulation. The pristine target ISA confirms this sequence for both FP32 and FP64. Remove only the initialization barrier and retain all waits and the final reduction barrier. FP64 uses a CAS retry loop; its proven initial load is observed as part of the relaxed atomic operation, without an ordering edge. Default/higher with 256 banks uses eight predeclared trials per dtype and a six-detection threshold, matching strict clean controls, complete evidence and healthy pre/post probes. Output corruption, timeout, signal or trap alone never counts as detection."
+          },
+          "environment": {
+            "RJ_CONSAN_FAULT_DROP_BARRIER": "1",
+            "RJ_CONSAN_FAULT_SITE_IDENTITY": "fnv1a64:fa708b4bef5cf6bb|kernel=_ZN2at4cuda17kernelHistogram1DIfflLi1ELi2ELin1ELNS0_23CUDAHistogramMemoryTypeE0EZNS0_21CUDA_tensor_histogramIffLb0EEEbNS_6TensorES4_S4_lNS_14AccumulateTypeIT0_Lb1EE4typeES8_NS0_13TensorArgTypeES9_S9_EUllE0_EEvNS0_6detail10TensorInfoIT_T1_EESF_NSC_IKS6_SE_EElS8_S8_SE_T6_|kind=barrier|pc=0x0000000000038cd4|mnemonic=s_barrier|occurrence=0"
+          },
+          "profiles": {
+            "default": {
+              "detector": "statistical",
+              "minimum_detections": 6,
+              "oracle": "any",
+              "trials": [
+                {
+                  "RJ_CONSAN_PRESET": "higher",
+                  "RJ_CONSAN_WATCHPOINT_BANKS": "256"
+                },
+                {
+                  "RJ_CONSAN_PRESET": "higher",
+                  "RJ_CONSAN_WATCHPOINT_BANKS": "256"
+                },
+                {
+                  "RJ_CONSAN_PRESET": "higher",
+                  "RJ_CONSAN_WATCHPOINT_BANKS": "256"
+                },
+                {
+                  "RJ_CONSAN_PRESET": "higher",
+                  "RJ_CONSAN_WATCHPOINT_BANKS": "256"
+                },
+                {
+                  "RJ_CONSAN_PRESET": "higher",
+                  "RJ_CONSAN_WATCHPOINT_BANKS": "256"
+                },
+                {
+                  "RJ_CONSAN_PRESET": "higher",
+                  "RJ_CONSAN_WATCHPOINT_BANKS": "256"
+                },
+                {
+                  "RJ_CONSAN_PRESET": "higher",
+                  "RJ_CONSAN_WATCHPOINT_BANKS": "256"
+                },
+                {
+                  "RJ_CONSAN_PRESET": "higher",
+                  "RJ_CONSAN_WATCHPOINT_BANKS": "256"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "id": "drop-histogram-fp64-initialization-higher-256",
+          "family": "barrier-drop",
+          "reach_witness": {
+            "kind": "reviewed-unconditional-final-isa",
+            "evidence": "The exact histogram case dispatches two 512-thread workgroups per dtype. Cooperative initialization stores are followed by EXEC reconvergence, a completion wait and an unconditional singleton barrier before atomic bin accumulation. The pristine target ISA confirms this sequence for both FP32 and FP64. Remove only the initialization barrier and retain all waits and the final reduction barrier. FP64 uses a CAS retry loop; its proven initial load is observed as part of the relaxed atomic operation, without an ordering edge. Default/higher with 256 banks uses eight predeclared trials per dtype and a six-detection threshold, matching strict clean controls, complete evidence and healthy pre/post probes. Output corruption, timeout, signal or trap alone never counts as detection."
+          },
+          "environment": {
+            "RJ_CONSAN_FAULT_DROP_BARRIER": "1",
+            "RJ_CONSAN_FAULT_SITE_IDENTITY": "fnv1a64:fa708b4bef5cf6bb|kernel=_ZN2at4cuda17kernelHistogram1DIddlLi1ELi2ELin1ELNS0_23CUDAHistogramMemoryTypeE0EZNS0_21CUDA_tensor_histogramIddLb0EEEbNS_6TensorES4_S4_lNS_14AccumulateTypeIT0_Lb1EE4typeES8_NS0_13TensorArgTypeES9_S9_EUllE0_EEvNS0_6detail10TensorInfoIT_T1_EESF_NSC_IKS6_SE_EElS8_S8_SE_T6_|kind=barrier|pc=0x0000000000036bd8|mnemonic=s_barrier|occurrence=0"
+          },
+          "profiles": {
+            "default": {
+              "detector": "statistical",
+              "minimum_detections": 6,
+              "oracle": "any",
+              "trials": [
+                {
+                  "RJ_CONSAN_PRESET": "higher",
+                  "RJ_CONSAN_WATCHPOINT_BANKS": "256"
+                },
+                {
+                  "RJ_CONSAN_PRESET": "higher",
+                  "RJ_CONSAN_WATCHPOINT_BANKS": "256"
+                },
+                {
+                  "RJ_CONSAN_PRESET": "higher",
+                  "RJ_CONSAN_WATCHPOINT_BANKS": "256"
+                },
+                {
+                  "RJ_CONSAN_PRESET": "higher",
+                  "RJ_CONSAN_WATCHPOINT_BANKS": "256"
+                },
+                {
+                  "RJ_CONSAN_PRESET": "higher",
+                  "RJ_CONSAN_WATCHPOINT_BANKS": "256"
+                },
+                {
+                  "RJ_CONSAN_PRESET": "higher",
+                  "RJ_CONSAN_WATCHPOINT_BANKS": "256"
+                },
+                {
+                  "RJ_CONSAN_PRESET": "higher",
+                  "RJ_CONSAN_WATCHPOINT_BANKS": "256"
+                },
+                {
+                  "RJ_CONSAN_PRESET": "higher",
+                  "RJ_CONSAN_WATCHPOINT_BANKS": "256"
+                }
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "pytorch-torch-topk": {
+      "faults": [
+        {
+          "id": "drop-topk-bf16-radix-count-publication-high",
+          "family": "barrier-drop",
+          "environment": {
+            "RJ_CONSAN_FAULT_DROP_BARRIER": "1",
+            "RJ_CONSAN_FAULT_SITE_IDENTITY": "fnv1a64:c0a9903c838d048a|kernel=_ZN2at6native6sbtopk10gatherTopKIN3c108BFloat16EjLi2ELb0EEEvNS_4cuda6detail10TensorInfoIKT_T0_EESA_SA_bSA_SA_NS7_IS8_SA_EESA_NS7_IlSA_EESA_PS8_|kind=barrier|pc=0x00000000008840a4|mnemonic=s_barrier|occurrence=3"
+          },
+          "profiles": {
+            "default": {
+              "detector": "statistical",
+              "minimum_detections": 6,
+              "oracle": "any",
+              "trials": [
+                {
+                  "RJ_CONSAN_PRESET": "high"
+                },
+                {
+                  "RJ_CONSAN_PRESET": "high"
+                },
+                {
+                  "RJ_CONSAN_PRESET": "high"
+                },
+                {
+                  "RJ_CONSAN_PRESET": "high"
+                },
+                {
+                  "RJ_CONSAN_PRESET": "high"
+                },
+                {
+                  "RJ_CONSAN_PRESET": "high"
+                },
+                {
+                  "RJ_CONSAN_PRESET": "high"
+                },
+                {
+                  "RJ_CONSAN_PRESET": "high"
+                }
+              ]
+            }
+          }
+        }
+      ]
     }
   }
 }

@@ -34,13 +34,15 @@ class ConSanValidationTargetAdmissionTest(unittest.TestCase):
                 self.assertEqual(fault['profiles'][profile]['minimum_detections'], 6)
                 self.assertEqual(len(fault['profiles'][profile]['trials']), 8)
 
-    def test_gfx1100_admits_initial_torch_workloads(self) -> None:
+    def test_gfx1100_admits_native_torch_workloads(self) -> None:
         workspace = Path('/workspace')
         python = workspace / 'consan-pytorch-venv/bin/python'
         for workload_id in (
             'pytorch-torch-mode',
             'pytorch-torch-sort',
             'pytorch-norm-softmax',
+            'pytorch-torch-topk',
+            'pytorch-torch-histc',
         ):
             with self.subTest(workload=workload_id):
                 workload = validation._workload_for_target('gfx1100', workload_id)
