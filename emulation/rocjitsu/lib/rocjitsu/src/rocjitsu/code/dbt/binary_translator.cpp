@@ -1239,11 +1239,19 @@ kernel_translation_scopes(const std::vector<std::unique_ptr<BasicBlock>> &blocks
 /// value could be a relocated PC that needs the recovery this bypasses. A PC-relative builder
 /// feeding the terminator is not reached here at all: the caller's recovered-indirect and
 /// direct-branch tests run first and claim that shape.
-[[nodiscard]] std::unordered_set<uint64_t>
-adopted_root_return_offsets(const BlockOffsetIndex &block_index,
-                            std::span<const uint64_t> adopted_roots,
-                            std::span<const uint8_t> text) {
+[[nodiscard]] std::unordered_set<uint64_t> adopted_root_return_offsets(
+    const BlockOffsetIndex &block_index, std::span<const uint64_t> adopted_roots,
+    std::span<const KernelTranslationScope> scopes, std::span<const uint8_t> text) {
   std::unordered_set<uint64_t> returns;
+  if (adopted_roots.empty())
+    return returns;
+
+  // The global CFG includes decoded padding that falls through into live code. Only blocks
+  // emitted by a kernel scope (including adopted roots and callees) can contribute a path.
+  // Keep paths from other entries visible: they are not evidence for this root's entry state.
+  std::unordered_set<const BasicBlock *> reachable;
+  for (const KernelTranslationScope &scope : scopes)
+    reachable.insert(scope.blocks.begin(), scope.blocks.end());
   // AMDGPU pads between functions rather than ending one with a terminator, so a forward walk from
   // one root falls straight through into the next. Several pointer-only functions can share a
   // scope, and crossing that boundary would classify the next root's s_setpc against this root's
@@ -1277,6 +1285,20 @@ adopted_root_return_offsets(const BlockOffsetIndex &block_index,
         stack.push_back(succ);
       }
     }
+
+    const auto append_reaching_predecessors =
+        [&](BasicBlock &block, std::vector<std::pair<BasicBlock *, const Instruction *>> &work) {
+          bool has_body_predecessor = false;
+          for (BasicBlock *pred : block.predecessors()) {
+            if (body.contains(pred)) {
+              work.emplace_back(pred, nullptr);
+              has_body_predecessor = true;
+            } else if (pred == nullptr || reachable.contains(pred)) {
+              return false;
+            }
+          }
+          return has_body_predecessor;
+        };
 
     // Whether (vgpr, lane) still holds what `v_writelane_b32` put there from `sgpr`, asked at one
     // program point rather than of the body as a whole. A body-wide set of saves cannot answer
@@ -1487,14 +1509,10 @@ adopted_root_return_offsets(const BlockOffsetIndex &block_index,
         // the caller's value comes from, here the save has to be inside the body.
         if (block == entry)
           return false;
-        // Reconverging control flow -- a diamond, or a loop back edge -- reaches a block that is
-        // already queued or done. That is ordinary, not a reason to give up on the whole query; the
-        // dedup above absorbs it. Only a block with no predecessor inside the body is a path this
-        // analysis cannot see, and that still fails closed.
-        if (block->predecessors().empty())
+        // The seen set handles diamonds and loops; missing or foreign live predecessors
+        // still fail closed, while unreachable decoded padding contributes no path.
+        if (!append_reaching_predecessors(*block, work))
           return false;
-        for (BasicBlock *pred : block->predecessors())
-          work.emplace_back(pred, nullptr);
       }
       return true;
     };
@@ -1597,18 +1615,13 @@ adopted_root_return_offsets(const BlockOffsetIndex &block_index,
         if (resolved)
           continue;
         // No definition in this block. The function entry means the value is the caller's; any
-        // other block defers to its predecessors, and a predecessor outside the body is a path
-        // this analysis cannot see, so it fails closed above.
+        // other block defers to its reachable predecessors in this body's entry context.
         if (block == entry)
           continue;
-        // Reconverging control flow -- a diamond, or a loop back edge -- reaches a block that is
-        // already queued or done. That is ordinary, not a reason to give up on the whole query; the
-        // dedup above absorbs it. Only a block with no predecessor inside the body is a path this
-        // analysis cannot see, and that still fails closed.
-        if (block->predecessors().empty())
+        // The seen set handles diamonds and loops; missing or foreign live predecessors
+        // still fail closed, while unreachable decoded padding contributes no path.
+        if (!append_reaching_predecessors(*block, work))
           return false;
-        for (BasicBlock *pred : block->predecessors())
-          work.emplace_back(pred, nullptr);
       }
       return true;
     };
@@ -3247,7 +3260,7 @@ TranslatedCodeObject BinaryTranslator::translate_impl(const AmdGpuCodeObject &ob
   const std::unordered_set<uint64_t> adopted_root_offsets(adopted_roots.begin(),
                                                           adopted_roots.end());
   const std::unordered_set<uint64_t> adopted_return_offsets =
-      adopted_root_return_offsets(block_index, adopted_roots, text);
+      adopted_root_return_offsets(block_index, adopted_roots, scopes, text);
 
   // An address consumed by loaded data must survive translation even when no direct branch reaches
   // it. Function-table targets may have been adopted into the emitted scopes above; fail before

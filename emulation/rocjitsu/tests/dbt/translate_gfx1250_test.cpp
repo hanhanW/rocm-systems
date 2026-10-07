@@ -2843,7 +2843,46 @@ TEST(BinaryTranslatorE2E, Gfx1250StopsAdoptedRootReturnWalkAtTheNextRoot) {
 namespace {
 
 [[nodiscard]] rocjitsu::TranslatedCodeObject
-translate_adopted_nonleaf_lane_restore(bool callee_clobbers_saved_lane) {
+translate_adopted_leaf_with_padding(bool padding_reachable,
+                                    std::optional<uint8_t> clobbered_sgpr = std::nullopt,
+                                    bool padding_is_kernel_entry = false) {
+  const std::vector<uint32_t> words = {
+      // Withhold the whole-object fallback so only a proven return can admit the setpc.
+      rocjitsu::build_s_getpc_b64(10, ROCJITSU_CODE_ARCH_CDNA5),
+      rocjitsu::build_s_endpgm(ROCJITSU_CODE_ARCH_CDNA5),
+      rocjitsu::build_s_endpgm(ROCJITSU_CODE_ARCH_CDNA5), // Separate kernel 1 entry.
+      padding_reachable
+          ? cdna5::build_sopp(cdna5::kSCbranchScc0Sopp, {.simm16 = 1})[0]
+          : rocjitsu::build_s_branch(1, ROCJITSU_CODE_ARCH_CDNA5), // root: skip word 4.
+      clobbered_sgpr
+          ? cdna5::build_sop1(cdna5::kSMovB32Sop1, {.ssrc0 = 128, .sdst = *clobbered_sgpr})[0]
+          : rocjitsu::build_s_nop(0, ROCJITSU_CODE_ARCH_CDNA5),
+      cdna5::build_sopp(cdna5::kSCbranchScc0Sopp, {.simm16 = 1})[0], // diamond -> word 7.
+      rocjitsu::build_s_nop(0, ROCJITSU_CODE_ARCH_CDNA5),
+      cdna5::build_sopp(cdna5::kSCbranchScc0Sopp,
+                        {.simm16 = static_cast<uint16_t>(-3)})[0], // loop -> word 5.
+      rocjitsu::build_s_setpc_b64(30, ROCJITSU_CODE_ARCH_CDNA5),
+      rocjitsu::build_s_endpgm(ROCJITSU_CODE_ARCH_CDNA5),
+  };
+  auto image =
+      rocjitsu::test_support::make_minimal_amdgpu_elf_with_two_kernels_and_function_pointers(
+          words, /*kernel1_entry_word=*/padding_is_kernel_entry ? 4 : 2,
+          {{.offset_word = 3, .words = 6}});
+  rocjitsu::AmdGpuCodeObject source(image.data(), image.size());
+  EXPECT_TRUE(source.is_valid());
+  rocjitsu::BinaryTranslator translator(
+      ROCJITSU_CODE_ARCH_CDNA5, ROCJITSU_CODE_ARCH_CDNA5, 0,
+      gfx1250_revision_options(rocjitsu::ProcessorRevision::Gfx1250B0,
+                               rocjitsu::ProcessorRevision::Gfx1250A0));
+  return translator.translate(source);
+}
+
+enum class AdoptedLaneMutation { None, WrongRestoreLane, MissingSave, ChangedBank };
+
+[[nodiscard]] rocjitsu::TranslatedCodeObject
+translate_adopted_nonleaf_lane_restore(bool callee_clobbers_saved_lane,
+                                       bool add_unreachable_padding = false,
+                                       AdoptedLaneMutation mutation = AdoptedLaneMutation::None) {
   constexpr uint32_t kEndpgm = 0xBFB00000u;
   constexpr uint32_t kNop = 0xBF800000u;
   constexpr uint32_t kSetPcS30 = 0xBE80481Eu;
@@ -2856,7 +2895,7 @@ translate_adopted_nonleaf_lane_restore(bool callee_clobbers_saved_lane) {
   // a recovered PC-relative target, restores the lanes, and returns. v24 is
   // caller-saved, so the return is valid only when the decoded callee closure
   // proves that exact lane survives.
-  const std::vector<uint32_t> words = {
+  std::vector<uint32_t> words = {
       rocjitsu::build_s_getpc_b64(10, ROCJITSU_CODE_ARCH_CDNA5),
       // word 0: kernel 0 leaves an unresolved PC producer, preventing the
       // whole-object relocated-by-construction fallback from masking whether
@@ -2886,10 +2925,24 @@ translate_adopted_nonleaf_lane_restore(bool callee_clobbers_saved_lane) {
       kEndpgm,
   };
 
+  if (mutation == AdoptedLaneMutation::WrongRestoreLane)
+    words[19] = 0x02010318u; // Restore s30 from lane 1, which holds s31.
+  if (mutation == AdoptedLaneMutation::MissingSave) {
+    words[8] = rocjitsu::build_s_branch(1, ROCJITSU_CODE_ARCH_CDNA5);
+    words[9] = kNop; // Skip the s30 save while keeping the s31 save reachable.
+  }
+  if (mutation == AdoptedLaneMutation::ChangedBank)
+    words[16] = cdna5::build_sopp(cdna5::kSSetVgprMsbSopp, {.simm16 = 0x01})[0];
+  if (add_unreachable_padding) {
+    // A branch skips alignment padding before the restores. Its fallthrough edge into
+    // the restore block must not invalidate the saved-lane proof across the call.
+    words.insert(words.begin() + 18, {rocjitsu::build_s_branch(1, ROCJITSU_CODE_ARCH_CDNA5), kNop});
+  }
   auto image =
       rocjitsu::test_support::make_minimal_amdgpu_elf_with_two_kernels_and_function_pointers(
           words, /*kernel1_entry_word=*/1,
-          {{.offset_word = 4, .words = 2}, {.offset_word = 8, .words = 15}});
+          {{.offset_word = 4, .words = 2},
+           {.offset_word = 8, .words = add_unreachable_padding ? 17u : 15u}});
   rocjitsu::AmdGpuCodeObject source(image.data(), image.size());
   EXPECT_TRUE(source.is_valid());
   rocjitsu::BinaryTranslator translator(
@@ -2900,6 +2953,59 @@ translate_adopted_nonleaf_lane_restore(bool callee_clobbers_saved_lane) {
 }
 
 } // namespace
+
+TEST(BinaryTranslatorE2E, Gfx1250AdoptedLeafReturnIgnoresUnreachablePadding) {
+  const auto first = translate_adopted_leaf_with_padding(/*padding_reachable=*/false);
+  ASSERT_TRUE(first.ok()) << (first.diagnostics.empty() ? "" : first.diagnostics.front().message);
+  rocjitsu::AmdGpuCodeObject translated(first.elf_bytes.data(), first.elf_bytes.size());
+  ASSERT_TRUE(translated.is_valid());
+  EXPECT_FALSE(rocjitsu::discover_relocation_function_tables(translated).empty());
+  rocjitsu::BinaryTranslator translator(
+      ROCJITSU_CODE_ARCH_CDNA5, ROCJITSU_CODE_ARCH_CDNA5, 0,
+      gfx1250_revision_options(rocjitsu::ProcessorRevision::Gfx1250B0,
+                               rocjitsu::ProcessorRevision::Gfx1250A0));
+  const auto second = translator.translate(translated);
+  ASSERT_TRUE(second.ok()) << (second.diagnostics.empty() ? ""
+                                                          : second.diagnostics.front().message);
+  EXPECT_EQ(first.elf_bytes, second.elf_bytes);
+}
+
+TEST(BinaryTranslatorE2E, Gfx1250AdoptedLeafReturnRejectsReachableHalfClobber) {
+  for (uint8_t sgpr : {30, 31}) {
+    SCOPED_TRACE(sgpr);
+    EXPECT_TRUE(refused_unrecovered_transfer(
+        translate_adopted_leaf_with_padding(/*padding_reachable=*/true, sgpr)));
+  }
+  EXPECT_TRUE(translate_adopted_leaf_with_padding(/*padding_reachable=*/true).ok());
+}
+
+TEST(BinaryTranslatorE2E, Gfx1250AdoptedLeafReturnRejectsOtherKernelPredecessor) {
+  EXPECT_TRUE(refused_unrecovered_transfer(translate_adopted_leaf_with_padding(
+      /*padding_reachable=*/false, std::nullopt, /*padding_is_kernel_entry=*/true)));
+}
+
+TEST(BinaryTranslatorE2E, Gfx1250AdoptedNonleafReturnIgnoresUnreachablePadding) {
+  const auto result = translate_adopted_nonleaf_lane_restore(
+      /*callee_clobbers_saved_lane=*/false, /*add_unreachable_padding=*/true);
+  ASSERT_TRUE(result.ok()) << (result.diagnostics.empty() ? ""
+                                                          : result.diagnostics.front().message);
+}
+
+TEST(BinaryTranslatorE2E, Gfx1250AdoptedNonleafPaddingDoesNotHideCalleeClobber) {
+  EXPECT_TRUE(refused_unrecovered_transfer(translate_adopted_nonleaf_lane_restore(
+      /*callee_clobbers_saved_lane=*/true, /*add_unreachable_padding=*/true)));
+}
+
+TEST(BinaryTranslatorE2E, Gfx1250AdoptedNonleafPaddingDoesNotHideInvalidRestore) {
+  for (AdoptedLaneMutation mutation :
+       {AdoptedLaneMutation::WrongRestoreLane, AdoptedLaneMutation::MissingSave,
+        AdoptedLaneMutation::ChangedBank}) {
+    SCOPED_TRACE(static_cast<int>(mutation));
+    const auto result = translate_adopted_nonleaf_lane_restore(
+        /*callee_clobbers_saved_lane=*/false, /*add_unreachable_padding=*/true, mutation);
+    EXPECT_TRUE(refused_unrecovered_transfer(result));
+  }
+}
 
 TEST(BinaryTranslatorE2E, Gfx1250AdoptedNonleafReturnTracksExactCallerSavedLane) {
   const auto result = translate_adopted_nonleaf_lane_restore(/*callee_clobbers_saved_lane=*/false);
