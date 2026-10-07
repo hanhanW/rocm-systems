@@ -1933,6 +1933,76 @@ TEST(ConSan, Cdna4HistogramLdsAtomicsAreAccessesButNotSynchronization) {
   EXPECT_TRUE(shadow_kind_conflicts(ShadowAccessKind::Atomic, ShadowAccessKind::Write));
 }
 
+TEST(ConSan, Rdna3HistogramLdsAtomicsRetainExactGuestInstructions) {
+  // Native gfx1100 PyTorch histc instructions. The FP64 CAS aliases its
+  // replacement and result pair, as the compiler's retry loop requires.
+  constexpr std::array<std::array<uint32_t, 2>, 2> atomics = {{
+      {0xd8540000u, 0x00000f02u}, // ds_add_f32 v2, v15
+      {0xd9c00000u, 0x0c0a0c02u}, // ds_cmpstore_rtn_b64 v[12:13], v2, v[12:13], v[10:11]
+  }};
+  const std::array<uint32_t, 5> words = {
+      atomics[0][0],
+      atomics[0][1],
+      atomics[1][0],
+      atomics[1][1],
+      build_s_endpgm(ROCJITSU_CODE_ARCH_RDNA3),
+  };
+  const auto bytes = make_rdna3_lds_code_object(words, "rdna3_histogram_lds_atomics",
+                                                /*vgpr_granulated=*/3, /*wave32=*/true);
+  for (const Mode mode : kEnabledModes) {
+    SCOPED_TRACE(mode_label(mode));
+    TestOptions options = test_options();
+    options.mode = mode;
+    options.max_patches = 2;
+    options.probe_lds_check_trap = mode == Mode::SuperCollider;
+    options.track_barriers = false;
+    options.track_atomics = true;
+    options.report_buffer_address = 0x123456780000ull;
+    options.report_buffer_size = direct_report_bytes(8);
+    const TransformArtifacts result = test_lower_consan(bytes, options);
+    ASSERT_TRUE(patch_succeeded(result)) << testing::PrintToString(result.errors);
+    const auto &sites = result.program_inventory.access_sites();
+    ASSERT_EQ(sites.size(), 2u);
+    for (size_t i = 0; i < sites.size(); ++i) {
+      SCOPED_TRACE(i);
+      EXPECT_EQ(sites[i].kind, LdsAccessKind::Atomic);
+      ASSERT_EQ(sites[i].ranges.size(), 1u);
+      EXPECT_EQ(sites[i].ranges.front().byte_width, i == 0u ? 4u : 8u);
+      EXPECT_TRUE(sites[i].lowering.replay_guest_access.available());
+      EXPECT_FALSE(sites[i].lowering.compare_observed_value.available());
+    }
+    EXPECT_EQ(sites[1].operands.address_vgpr, 2u);
+    EXPECT_EQ(sites[1].operands.data_vgpr, 12u);
+    EXPECT_EQ(sites[1].operands.second_data_vgpr, 10u);
+    EXPECT_EQ(sites[1].operands.destination_vgpr, 12u);
+    EXPECT_TRUE(std::ranges::none_of(result.patches, [](const PatchInfo &patch) {
+      return patch.kind == PatchKind::TrampolineSyncMetadata;
+    }));
+    if (mode == Mode::SuperCollider) {
+      EXPECT_EQ(access_decision_count(result, SiteDecisionKind::NotApplicable), 2u);
+      EXPECT_EQ(access_lowering_count(result, LoweringOutcomeKind::Instrumented), 0u);
+      continue;
+    }
+    EXPECT_EQ(access_decision_count(result, SiteDecisionKind::Admitted), 2u);
+    ASSERT_EQ(access_lowering_count(result, LoweringOutcomeKind::Instrumented), 2u);
+    AmdGpuCodeObject patched(result.replacement.data(), result.replacement.size());
+    ASSERT_TRUE(patched.is_valid());
+    for (size_t i = 0; i < atomics.size(); ++i) {
+      const auto patch = std::ranges::find(result.patches, i * 8u, &PatchInfo::anchor_offset);
+      ASSERT_NE(patch, result.patches.end());
+      ASSERT_TRUE(patch->relocated_guest_instruction_offset);
+      EXPECT_EQ(text_words_at_offset(patched, *patch->relocated_guest_instruction_offset, 8u),
+                (std::vector<uint32_t>(atomics[i].begin(), atomics[i].end())));
+      const auto body =
+          text_words_at_offset(patched, patch->trampoline_offset, patch->trampoline_size);
+      size_t guest_count = 0u;
+      for (size_t word = 0; word + 1u < body.size(); ++word)
+        guest_count += body[word] == atomics[i][0] && body[word + 1u] == atomics[i][1];
+      EXPECT_EQ(guest_count, 1u);
+    }
+  }
+}
+
 TEST(ConSan, Rdna4HistogramLdsAtomicsAreAccessesButNotSynchronization) {
   constexpr auto add_u32 =
       rdna4::build_vds(rdna4::kDsAddU32Vds, {.offset0 = 4, .addr = 3, .data0 = 7});

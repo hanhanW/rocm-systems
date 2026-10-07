@@ -450,7 +450,7 @@ void try_apply_direct_watchpoint_patch(std::span<const uint8_t> bytes, const Opt
       return;
     }
     auto mapping = make_access_runtime_mapping(
-        std::move(*access), candidate.site().kind, planned_patch.emission.first_record_index,
+        std::move(*access), candidate.site().observation_kind(), planned_patch.emission.first_record_index,
         planned_patch.access_range_count, window_bank_count, patch);
     if (!mapping) {
       result.errors.emplace_back("ConSan probe lost its runtime attribution");

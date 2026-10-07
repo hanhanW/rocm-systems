@@ -26,6 +26,112 @@ VectorMemoryDecode decode_flat_words(const std::array<uint32_t, N> &words, rj_co
       {reinterpret_cast<const uint8_t *>(words.data()), words.size() * sizeof(uint32_t)}, arch);
 }
 
+std::vector<uint32_t> fp64_lds_atomic_add_words(rj_code_arch_t arch) {
+  const bool rdna3 = arch == ROCJITSU_CODE_ARCH_RDNA3;
+  const uint32_t wait = rdna3 ? 0xbf89fc07u : 0xbfc60000u;
+  std::vector<uint32_t> words = {
+      0xbe960080u, // s_mov_b32 s22, 0
+      0xd9d80000u,
+      0x0a000002u, // ds_load_b64 v[10:11], v2
+      wait,
+  };
+  if (rdna3)
+    words.insert(words.end(), {0xd727000cu, 0x0201e50au}); // v_add_f64 v[12:13], v[10:11], 1.0
+  else
+    words.push_back(0x041814f2u); // v_add_f64_e32 v[12:13], 1.0, v[10:11]
+  const std::array tail = {
+      0xd9c00000u,
+      0x0c0a0c02u, // ds_cmpstore_rtn_b64 v[12:13], v2, v[12:13], v[10:11]
+      wait,
+      0x7cb4150cu, // v_cmp_eq_u64_e32 vcc_lo, v[12:13], v[10:11]
+      0xca10010cu,
+      0x0a0a010du,                       // v_dual_mov_b32 v10, v12 :: v_dual_mov_b32 v11, v13
+      0x8c16166au,                       // s_or_b32 s22, vcc_lo, s22
+      0xbf870009u,                       // s_delay_alu instid0(SALU_CYCLE_1)
+      0x917e167eu,                       // s_and_not1_b32 exec_lo, exec_lo, s22
+      rdna3 ? 0xbfa6fff3u : 0xbfa6fff4u, // s_cbranch_execnz to the first wait
+      0x8c7e167eu,                       // s_or_b32 exec_lo, exec_lo, s22
+      build_s_endpgm(arch),
+  };
+  words.insert(words.end(), tail.begin(), tail.end());
+  return words;
+}
+
+TEST(ConSan, Fp64LdsAtomicAddSeedHasAtomicObservationWithoutChangingDecodedRead) {
+  for (const auto arch : {ROCJITSU_CODE_ARCH_RDNA3, ROCJITSU_CODE_ARCH_RDNA4}) {
+    SCOPED_TRACE(arch);
+    const auto words = fp64_lds_atomic_add_words(arch);
+    const auto bytes = arch == ROCJITSU_CODE_ARCH_RDNA3
+                           ? make_rdna3_lds_code_object(words, "atomic_add", 3, true)
+                           : make_rdna4_lds_code_object(words, "atomic_add", 3, true);
+    for (const Mode mode : kEnabledModes) {
+      SCOPED_TRACE(mode_label(mode));
+      TestOptions options = test_options();
+      options.mode = mode;
+      options.probe_lds_check_trap = mode == Mode::SuperCollider;
+      options.max_patches = 2;
+      options.track_barriers = false;
+      options.track_atomics = false;
+      options.report_buffer_address = 0x123456780000ull;
+      options.report_buffer_size = direct_report_bytes(8);
+      const auto result = test_lower_consan(bytes, options);
+      ASSERT_TRUE(patch_succeeded(result)) << testing::PrintToString(result.errors);
+      const auto sites = result.program_inventory.access_sites();
+      ASSERT_EQ(sites.size(), 2u);
+      EXPECT_EQ(sites[0].kind, LdsAccessKind::Read);
+      EXPECT_EQ(sites[0].observation_kind(), LdsAccessKind::Atomic);
+      EXPECT_EQ(sites[0].relaxed_atomic_seed_for, sites[1].text_offset());
+      EXPECT_EQ(sites[0].lowering.form->destination_vgpr, 10u);
+      EXPECT_EQ(sites[0].lowering.form->destination_register_count, 2u);
+      EXPECT_EQ(access_decision_count(result, SiteDecisionKind::Admitted),
+                mode == Mode::Default ? 2u : 0u);
+      EXPECT_EQ(access_lowering_count(result, LoweringOutcomeKind::Instrumented),
+                mode == Mode::Default ? 2u : 0u);
+      if (mode == Mode::SuperCollider)
+        EXPECT_EQ(result.observation_plan().site_decisions.front().reason,
+                  AccessPolicyReason::OperationKindExcluded);
+    }
+  }
+}
+
+TEST(ConSan, Fp64LdsAtomicAddSeedRejectsNearMisses) {
+  // Each mutation breaks one part of the compiler sequence's proof. An
+  // unqualified load must remain observable as an ordinary read.
+  const std::array mutations = {
+      std::pair{0u, 0xbfa10002u},  // Additional entry can bypass the initial load.
+      std::pair{2u, 0x0a000003u},  // Different load address.
+      std::pair{1u, 0xd9d80008u},  // Different static LDS offset.
+      std::pair{2u, 0x08000002u},  // Load does not seed the CAS comparison.
+      std::pair{3u, 0xbf800000u},  // No completion wait before reading the seed.
+      std::pair{5u, 0x0201e508u},  // Addition uses a different expected value.
+      std::pair{7u, 0x0c0a0c03u},  // CAS uses a different address.
+      std::pair{8u, 0xbf800000u},  // No completion wait before comparing the CAS result.
+      std::pair{9u, 0x7cb4110cu},  // Compare uses a different expected pair.
+      std::pair{11u, 0x0a0a010fu}, // Retry copies the wrong high word.
+      std::pair{12u, 0x8c16166cu}, // Completion mask does not consume VCC.
+      std::pair{12u, 0x8c16166bu}, // Completion mask reads VCC_HI.
+      std::pair{14u, 0x917e147eu}, // EXEC update uses a different completion mask.
+      std::pair{14u, 0x917e167fu}, // EXEC update reads EXEC_HI.
+      std::pair{15u, 0xbfa60000u}, // No retry backedge.
+      std::pair{15u, 0xbfa6fff1u}, // Retry reloads instead of using the CAS result.
+  };
+  for (const auto &[index, replacement] : mutations) {
+    SCOPED_TRACE(index);
+    auto words = fp64_lds_atomic_add_words(ROCJITSU_CODE_ARCH_RDNA3);
+    words[index] = replacement;
+    TestOptions options = test_options();
+    options.track_barriers = false;
+    options.track_atomics = false;
+    const auto result =
+        test_lower_consan(make_rdna3_lds_code_object(words, "near_atomic_add", 3, true), options);
+    ASSERT_TRUE(patch_succeeded(result)) << testing::PrintToString(result.errors);
+    const auto sites = result.program_inventory.access_sites();
+    ASSERT_EQ(sites.size(), 2u);
+    EXPECT_FALSE(sites[0].relaxed_atomic_seed_for);
+    EXPECT_EQ(sites[0].observation_kind(), LdsAccessKind::Read);
+  }
+}
+
 TEST(ConSan, MemoryScopeIsOneNormalizedCrossTargetContract) {
   EXPECT_TRUE(memory_scope_is_supported(MemoryScope::Wavefront));
   EXPECT_TRUE(memory_scope_is_supported(MemoryScope::Workgroup));

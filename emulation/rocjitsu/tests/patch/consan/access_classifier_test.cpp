@@ -125,6 +125,35 @@ TEST(ConSanAccessClassifier, NativeReplayAndValueComparisonNormalizeOnAllFiveTar
   }
 }
 
+TEST(ConSanAccessClassifier, NativeCompareExchangeReplaysBothWidthsWithoutValueComparison) {
+  for (const TargetCase &target : kTargets) {
+    SCOPED_TRACE(rj_code_target_name(target.target));
+    for (const uint32_t width : {32u, 64u}) {
+      SCOPED_TRACE(width);
+      const std::string mnemonic =
+          std::string(target.native_store == "ds_write_b32" ? "ds_cmpst_rtn_b"
+                                                            : "ds_cmpstore_rtn_b") +
+          std::to_string(width);
+      ProgramSite input = native_access_site(mnemonic, LdsAccessKind::Atomic, width);
+      input.operands.data_vgpr = 12u;
+      input.operands.second_data_vgpr = 10u;
+      input.operands.destination_vgpr = 12u;
+      const ProgramSite site = complete_site(std::move(input), target.arch, target.target);
+      ASSERT_TRUE(site.lowering.form);
+      EXPECT_EQ(site.lowering.form->kind, AccessLoweringFormKind::NativeSingleRange);
+      EXPECT_EQ(site.lowering.form->range_count, 1u);
+      EXPECT_EQ(site.lowering.form->element_width_bits, width);
+      EXPECT_EQ(site.lowering.form->data_register_count, width / 32u);
+      EXPECT_EQ(site.lowering.form->destination_register_count, width / 32u);
+      EXPECT_EQ(site.lowering.form->data_vgpr, 12u);
+      EXPECT_EQ(site.lowering.form->second_data_vgpr, 10u);
+      EXPECT_EQ(site.lowering.form->destination_vgpr, 12u);
+      EXPECT_TRUE(site.lowering.replay_guest_access.available());
+      EXPECT_FALSE(site.lowering.compare_observed_value.available());
+    }
+  }
+}
+
 TEST(ConSanAccessClassifier, LaneAddressedDirectToLdsWritesSupportValueComparison) {
   ProgramSite input;
   input.origin = AccessOrigin::DirectToLds;

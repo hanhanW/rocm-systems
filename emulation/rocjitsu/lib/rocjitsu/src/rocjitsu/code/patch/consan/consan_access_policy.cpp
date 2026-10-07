@@ -136,12 +136,12 @@ source_container_names(const ProgramInventory &inventory,
                     lhs.address_space, lhs.provenance, lhs.confidence, lhs.lowering,
                     lhs.decoded_file_offset(), lhs.size(), lhs.decoded_width_bits,
                     lhs.mnemonic_view(), lhs.flat_address_space_hint, lhs.operands, lhs.ranges,
-                    lhs.exclusions) ==
+                    lhs.exclusions, lhs.relaxed_atomic_seed_for) ==
          std::tuple(container_kind(rhs), container_entry(rhs), rhs.origin, rhs.kind,
                     rhs.address_space, rhs.provenance, rhs.confidence, rhs.lowering,
                     rhs.decoded_file_offset(), rhs.size(), rhs.decoded_width_bits,
                     rhs.mnemonic_view(), rhs.flat_address_space_hint, rhs.operands, rhs.ranges,
-                    rhs.exclusions);
+                    rhs.exclusions, rhs.relaxed_atomic_seed_for);
 }
 
 [[nodiscard]] AccessPolicyReason access_classifier_reason(AccessClassifierReason reason,
@@ -700,9 +700,10 @@ AccessPolicyResult plan_access_observation(const ProgramInventory &inventory,
                capability_disposition(inventory.target(), request.mode, form) !=
                    CapabilityDisposition::Supported) {
       reason = AccessPolicyReason::TargetCapabilityUnavailable;
-    } else if (access.kind != LdsAccessKind::Read && access.kind != LdsAccessKind::Write &&
+    } else if (access.observation_kind() != LdsAccessKind::Read &&
+               access.observation_kind() != LdsAccessKind::Write &&
                !(request.mode != Mode::SuperCollider && !flat &&
-                 access.kind == LdsAccessKind::Atomic &&
+                 access.observation_kind() == LdsAccessKind::Atomic &&
                  arch_supports_capability_form(inventory.arch(),
                                                CapabilityForm::RelaxedLdsAtomicAccess) &&
                  access.lowering.operation(AccessLoweringOperation::ReplayGuestAccess)

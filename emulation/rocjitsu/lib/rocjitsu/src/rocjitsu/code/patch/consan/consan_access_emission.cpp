@@ -400,7 +400,7 @@ using detail::WorkitemOwnerDerivationPlan;
     errors.emplace_back("ConSan probe needs seven aligned VCC/EXEC/SCC-save SGPRs in 0..104");
     return std::nullopt;
   }
-  const auto kind = shadow_kind_from_access_kind(candidate.site().kind);
+  const auto kind = shadow_kind_from_access_kind(candidate.site().observation_kind());
   const uint32_t generation = plan.report_generation & watchpoint::max_generation;
   const uint64_t generation_field = static_cast<uint64_t>(generation)
                                     << watchpoint::generation_shift;

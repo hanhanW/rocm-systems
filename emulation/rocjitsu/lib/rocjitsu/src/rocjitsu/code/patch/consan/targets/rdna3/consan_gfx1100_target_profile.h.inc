@@ -6,6 +6,7 @@ inline constexpr TargetProfile kGfx1100TargetProfile = [] {
   TargetProfile profile = rdna_target_profile_defaults();
   profile.target = ROCJITSU_CODE_TARGET_GFX1100;
   profile.arch = ROCJITSU_CODE_ARCH_RDNA3;
+  profile.semantic_form_mask |= capability_form_bit(CapabilityForm::RelaxedLdsAtomicAccess);
   profile.placement.prefer_literal_dispatch_identity = true;
   profile.scalar_placement_model = ScalarPlacementModel::LivenessOnly;
   profile.program_analysis = &kRdna3ProgramAnalysisOperations;

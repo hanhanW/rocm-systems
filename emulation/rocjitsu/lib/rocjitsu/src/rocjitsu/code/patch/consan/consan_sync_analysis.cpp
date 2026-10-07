@@ -2154,6 +2154,111 @@ void associate_ordinary_acquire_sync_sequences(
   return owners == owners_by_block.end() ? std::vector<ExecutionOwner>{} : owners->second;
 }
 
+// LLVM lowers a relaxed FP64 LDS atomic add to an initial load followed by a
+// compare/exchange retry loop. The load is the atomic operation's initial
+// value, not an ordinary read racing with another lane's CAS. Qualify only
+// the complete native compiler shape: unique entry, same address, both waits,
+// expected/replacement/result dataflow, success mask, and retry backedge.
+// Near matches retain ordinary-read semantics. No synchronization is inferred.
+[[nodiscard]] std::optional<std::pair<uint64_t, uint64_t>>
+native_fp64_atomic_seed(BasicBlock &loop, rj_code_arch_t arch) {
+  if (loop.successor_issue() != BasicBlock::SuccessorIssue::None || !loop.call_edges().empty() ||
+      loop.predecessors().size() != 2u || loop.successors().size() != 2u ||
+      std::ranges::find(loop.successors(), &loop) == loop.successors().end())
+    return std::nullopt;
+  BasicBlock *entry = nullptr;
+  for (BasicBlock *predecessor : loop.predecessors())
+    if (predecessor != &loop)
+      entry = predecessor;
+  if (entry == nullptr || entry->successor_issue() != BasicBlock::SuccessorIssue::None ||
+      !entry->call_edges().empty() || entry->successors().size() != 1u ||
+      entry->successors().front() != &loop || entry->end_offset() != loop.start_offset())
+    return std::nullopt;
+  const Instruction *load = nullptr;
+  for (const Instruction &instruction : entry->instructions())
+    load = &instruction;
+  if (load == nullptr || load->mnemonic() != "ds_load_b64")
+    return std::nullopt;
+
+  std::array<const Instruction *, 9> body{};
+  size_t count = 0u;
+  for (const Instruction &instruction : loop.instructions()) {
+    if (instruction.mnemonic() == "s_delay_alu" || instruction.mnemonic() == "s_nop")
+      continue;
+    if (count == body.size())
+      return std::nullopt;
+    body[count++] = &instruction;
+  }
+  if (count != body.size())
+    return std::nullopt;
+  const auto drains_lds = [arch](const Instruction &instruction) {
+    return instruction.raw_encoding() &&
+           classify_wait_instruction(instruction.mnemonic(), instruction.raw_encoding()[0], arch)
+               .drains_lds;
+  };
+  if (!drains_lds(*body[0]) || !drains_lds(*body[3]) ||
+      (body[1]->mnemonic() != "v_add_f64" && body[1]->mnemonic() != "v_add_f64_e32") ||
+      body[2]->mnemonic() != "ds_cmpstore_rtn_b64" || body[4]->mnemonic() != "v_cmp_eq_u64_e32" ||
+      body[5]->mnemonic() != "v_dual_mov_b32 :: v_dual_mov_b32" ||
+      body[6]->mnemonic() != "s_or_b32" || body[7]->mnemonic() != "s_and_not1_b32" ||
+      body[8]->mnemonic() != "s_cbranch_execnz")
+    return std::nullopt;
+
+  const auto reg = [](const Operand *operand) {
+    return operand ? operand->to_register_ref() : std::nullopt;
+  };
+  const auto expected = reg(load->dst_operand(0));
+  const auto address = reg(load->src_operand(0));
+  const auto result = reg(body[2]->dst_operand(0));
+  const auto done = reg(body[6]->dst_operand(0));
+  if (!expected || expected->cls != RegClass::VGPR || expected->width != 2u || !address ||
+      address->cls != RegClass::VGPR || address->width != 1u || !result ||
+      result->cls != RegClass::VGPR || result->width != 2u || !done ||
+      done->cls != RegClass::SGPR || done->width != 1u)
+    return std::nullopt;
+  const auto overlaps = [](const RegisterRef &a, const RegisterRef &b) {
+    return a.cls == b.cls && a.index < b.index + b.width && b.index < a.index + a.width;
+  };
+  if (overlaps(*expected, *result) || overlaps(*expected, *address) || overlaps(*result, *address))
+    return std::nullopt;
+  const auto matches = [&](const Operand *operand, const RegisterRef &reference) {
+    return reg(operand) == reference;
+  };
+  const auto special = [&](const Operand *operand, RegClass cls) {
+    // VOPC's fieldless VCC destination has no ordinary RegisterRef.
+    if (operand && operand->to_special_reg_class() == cls)
+      return true;
+    const auto reference = reg(operand);
+    const uint16_t low_selector =
+        cls == RegClass::VCC ? scalar_operand_vcc_lo(arch) : scalar_operand_exec_lo(arch);
+    return reference && reference->cls == cls && reference->width == 1u &&
+           operand->encoding_value() == low_selector;
+  };
+  // DATA0 is the replacement, DATA1 the comparison, and VDST the old value.
+  // The compiler aliases the replacement/result pair and copies both returned
+  // words into the next iteration's expected pair after testing success.
+  if (!matches(body[1]->dst_operand(0), *result) ||
+      (!matches(body[1]->src_operand(0), *expected) &&
+       !matches(body[1]->src_operand(1), *expected)) ||
+      !matches(body[2]->src_operand(0), *address) || !matches(body[2]->src_operand(1), *result) ||
+      !matches(body[2]->src_operand(2), *expected) ||
+      !special(body[4]->dst_operand(0), RegClass::VCC) ||
+      !matches(body[4]->src_operand(0), *result) || !matches(body[4]->src_operand(1), *expected) ||
+      body[5]->num_dst_operands() != 2 || body[5]->num_src_operands() != 2 ||
+      !matches(body[5]->dst_operand(0), {RegClass::VGPR, expected->index, 1}) ||
+      !matches(body[5]->dst_operand(1),
+               {RegClass::VGPR, static_cast<uint16_t>(expected->index + 1u), 1}) ||
+      !matches(body[5]->src_operand(0), {RegClass::VGPR, result->index, 1}) ||
+      !matches(body[5]->src_operand(1),
+               {RegClass::VGPR, static_cast<uint16_t>(result->index + 1u), 1}) ||
+      !special(body[6]->src_operand(0), RegClass::VCC) ||
+      !matches(body[6]->src_operand(1), *done) ||
+      !special(body[7]->dst_operand(0), RegClass::EXEC) ||
+      !special(body[7]->src_operand(0), RegClass::EXEC) || !matches(body[7]->src_operand(1), *done))
+    return std::nullopt;
+  return std::pair{load->src_loc(), body[2]->src_loc()};
+}
+
 void annotate_execution_owners(const AmdGpuCodeObject &code_object, Decoder &decoder,
                                rj_code_arch_t arch,
                                const std::vector<std::unique_ptr<BasicBlock>> *reusable_blocks,
@@ -2201,9 +2306,10 @@ void annotate_execution_owners(const AmdGpuCodeObject &code_object, Decoder &dec
     }
   }
 
-  // Reuse the exact CFG boundaries already built for ownership. No facts
-  // cross a join, call, or EXEC change. Selectable bank transitions remain
-  // unsupported; a transition-free CDNA5 object uses the ABI entry bank zero.
+  // Reuse the exact CFG boundaries already built for ownership. Uniform-value
+  // facts do not cross a join, call, or EXEC change; atomic seed qualification
+  // uses the bounded entry/retry-loop proof above. Selectable bank transitions
+  // remain unsupported; a transition-free CDNA5 object uses ABI entry bank zero.
   const bool indexed_register_mode = std::ranges::any_of(blocks, [arch](const auto &block) {
     return std::ranges::any_of(block->instructions(), [arch](const Instruction &inst) {
       const auto name = inst.mnemonic();
@@ -2229,6 +2335,7 @@ void annotate_execution_owners(const AmdGpuCodeObject &code_object, Decoder &dec
     for (ProgramSite &site : inventory.program_sites) {
       site.uniform_lds_address = false;
       site.uniform_lds_store = false;
+      site.relaxed_atomic_seed_for.reset();
       if (site.lowering.form &&
           site.lowering.form->kind == AccessLoweringFormKind::NativeSingleRange &&
           site.lowering.form->address_vgpr && site.ranges.size() == 1u) {
@@ -2241,8 +2348,32 @@ void annotate_execution_owners(const AmdGpuCodeObject &code_object, Decoder &dec
       }
     }
     for (const auto &block : blocks) {
-      // Facts never leave this block. Instructions after its last consumer,
-      // and entire blocks without consumers, cannot affect an annotation.
+      if (const auto seed = native_fp64_atomic_seed(*block, arch)) {
+        const auto load = accesses.find(seed->first);
+        const auto cas = accesses.find(seed->second);
+        if (load != accesses.end() && cas != accesses.end()) {
+          for (ProgramSite *site : load->second) {
+            // Compare normalized intervals, including encoded LDS offsets;
+            // matching registers alone do not prove the same atomic object.
+            const bool same_object = std::ranges::all_of(cas->second, [&](const ProgramSite *rmw) {
+              return site->origin == AccessOrigin::NativeLds && site->kind == LdsAccessKind::Read &&
+                     rmw->origin == AccessOrigin::NativeLds && rmw->kind == LdsAccessKind::Atomic &&
+                     site->ranges.front().static_byte_offset &&
+                     site->ranges.front().static_byte_offset ==
+                         rmw->ranges.front().static_byte_offset &&
+                     site->ranges.front().byte_width == 8u &&
+                     rmw->ranges.front().byte_width == 8u &&
+                     site->ranges.front().geometry == AccessRangeGeometry::FixedWidth &&
+                     rmw->ranges.front().geometry == AccessRangeGeometry::FixedWidth &&
+                     site->decoded_width_bits == 64u && rmw->decoded_width_bits == 64u;
+            });
+            if (same_object)
+              site->relaxed_atomic_seed_for = seed->second;
+          }
+        }
+      }
+      // Uniform-value facts never leave this block. Instructions after its last
+      // consumer, and entire blocks without consumers, cannot affect an annotation.
       // The object-wide register-mode safety check above still scans all code.
       const auto last = last_access_by_block.find(block.get());
       if (last == last_access_by_block.end())
@@ -2298,11 +2429,15 @@ bool analyze_semantic_inventory(std::span<const uint8_t> code_object_bytes,
   if (!needs_semantic_inventory) {
     if (std::ranges::any_of(result.program_inventory.access_sites(), [&](const ProgramSite &site) {
           const ProgramContainer *container = result.program_inventory.container(site.container);
-          return container != nullptr && !container->is_kernel();
+          return (container != nullptr && !container->is_kernel()) ||
+                 (site.origin == AccessOrigin::NativeLds &&
+                  site.mnemonic_view() == "ds_cmpstore_rtn_b64");
         })) {
       // SuperCollider's ordinary clean transform does not consume
       // synchronization semantics. Shared-function sites still need kernel
-      // ownership, while kernel-local sites carry their descriptor directly.
+      // ownership, while native FP64 CAS loops need atomic seed qualification
+      // so their initial values do not become redundant ordinary observations.
+      // Other kernel-local sites carry their descriptor directly.
       const std::vector<std::unique_ptr<BasicBlock>> *blocks = nullptr;
       if (result.program_inventory.preapplied_mutation().code_ranges.empty()) {
         const auto cfg = detail::build_cfg_inputs_for_selection(

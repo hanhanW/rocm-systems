@@ -130,6 +130,10 @@ struct ProgramSite {
   /// Same-address ordinary store with every data word proven wave-uniform.
   /// Only its intra-instruction collision is benign; cross-wave checks remain.
   bool uniform_lds_store = false;
+  /// Initial native load in a proven compiler CAS retry loop. Preserve the
+  /// decoded read and its lowering operands; only observation treats this
+  /// atomic initial value as an atomic access. This is not an ordering edge.
+  std::optional<uint64_t> relaxed_atomic_seed_for;
   /// CFG-derived kernels that can execute this physical instruction. This is
   /// the authoritative owner proof for access and synchronization consumers;
   /// derived events retain only `source_site` rather than copying it.
@@ -139,6 +143,10 @@ struct ProgramSite {
   Payload payload;
 
   [[nodiscard]] bool has_access() const { return origin != AccessOrigin::Count; }
+
+  [[nodiscard]] LdsAccessKind observation_kind() const {
+    return relaxed_atomic_seed_for ? LdsAccessKind::Atomic : kind;
+  }
 
   template <typename Site> [[nodiscard]] const Site *get_if() const {
     return std::get_if<Site>(&payload);

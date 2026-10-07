@@ -23,7 +23,7 @@ a mode-specific lowering gap for a form admitted by the target family.
 | `gfx950` | SuperCollider | native LDS<br>group FLAT | workgroup (mutation only) | ordered FLAT (mutation only)<br>ordered VGLOBAL (mutation only) | addressed ordinary (mutation only) |
 | `gfx950` | ConSan | native LDS<br>group FLAT | workgroup | ordered FLAT<br>ordered VGLOBAL<br>relaxed LDS RMW (access only) | addressed ordinary (associated only) |
 | `gfx1100` | SuperCollider | native LDS<br>group FLAT | workgroup (mutation only) | ordered FLAT (mutation only)<br>ordered VGLOBAL (mutation only) | addressed ordinary (mutation only) |
-| `gfx1100` | ConSan | native LDS<br>group FLAT | workgroup | ordered FLAT<br>ordered VGLOBAL | addressed ordinary (associated only) |
+| `gfx1100` | ConSan | native LDS<br>group FLAT | workgroup | ordered FLAT<br>ordered VGLOBAL<br>relaxed LDS RMW (access only) | addressed ordinary (associated only) |
 | `gfx1201` | SuperCollider | native LDS<br>group FLAT | workgroup (mutation only) | ordered FLAT (mutation only)<br>ordered VGLOBAL (mutation only) | addressed ordinary (mutation only) |
 | `gfx1201` | ConSan | native LDS<br>group FLAT | workgroup | ordered FLAT<br>ordered VGLOBAL<br>relaxed LDS RMW (access only) | addressed ordinary (associated only) |
 | `gfx1250` | SuperCollider | native LDS<br>group FLAT | workgroup (mutation only)<br>cluster (mutation only) | ordered FLAT (mutation only)<br>ordered VGLOBAL (mutation only)<br>ordered LDS (mutation only) | addressed ordinary (mutation only) |
@@ -90,6 +90,14 @@ The second-address-group diagnostic test is qualified on gfx1201; its success
 must not be interpreted as a cross-target guarantee.
 
 ## Typed exclusions
+
+On RDNA3 and RDNA4, a recognized native FP64 atomic-add CAS loop can classify
+its initial LDS load as an atomic observation. This requires the complete
+entry/retry CFG, matching address and width, completion waits, and proven
+expected/result dataflow. The decoded instruction remains a load; the
+observation neither duplicates the guest operation nor creates an ordering
+edge. Unproven shapes remain ordinary reads. This is not general recognition
+of arbitrary software atomics.
 
 These exclusions are part of the contract:
 

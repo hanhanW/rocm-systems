@@ -52,8 +52,9 @@ template <typename Range>
 }
 
 [[nodiscard]] bool is_relaxed_lds_atomic(std::string_view mnemonic) {
-  constexpr std::array forms = {"ds_add_f32", "ds_add_f64",          "ds_add_u32",
-                                "ds_add_u64", "ds_cmpstore_rtn_b32", "ds_cmpst_rtn_b32"};
+  constexpr std::array forms = {"ds_add_f32",          "ds_add_f64",          "ds_add_u32",
+                                "ds_add_u64",          "ds_cmpstore_rtn_b32", "ds_cmpst_rtn_b32",
+                                "ds_cmpstore_rtn_b64", "ds_cmpst_rtn_b64"};
   return named(mnemonic, forms);
 }
 
