@@ -473,6 +473,20 @@ configuration.
 
 ### Preparing Qwen
 
+The input recipe lives in `iree-test-suites/torch_models/qwen3-600m/`.
+Its README documents `generate.py` and the export requirements. The quality
+JSON pins the matching external parameters, token input, and reference logits
+on Hugging Face; use that matched set with the committed `model.mlir` for a
+reproducible comparison. A checkout without this directory needs the test-suite
+sources provisioned before preparation; this is not a detector limitation.
+
+Place the three downloaded files under
+`iree-test-suites-build/torch_models/qwen3-600m/hf/qwen3-600m/` in the validation
+workspace, preserving their declared names. If regenerating instead, use a
+separate export environment with the recipe's requirements; do not replace the
+ROCm PyTorch installation used by other validation rows. Keep the regenerated
+MLIR, parameters, input, and reference output together.
+
 The Qwen row requires a generated VMFB with recorded compiler and input
 provenance:
 
