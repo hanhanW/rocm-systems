@@ -68,6 +68,94 @@ def _run(
 
 
 class ConSanBenchmarkTest(unittest.TestCase):
+    def test_profile_selection_preserves_native_controls_and_scopes_resume(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            executable = root / "executable"
+            executable.write_text("fixture")
+            common = [
+                "--target",
+                "gfx1100",
+                "--aorta-dir",
+                directory,
+                "--python",
+                str(executable),
+                "--hook",
+                str(executable),
+                "--rocprofv3",
+                str(executable),
+                "--output-dir",
+                directory,
+                "--workload",
+                "pytorch-dense-prefill",
+            ]
+            calls = []
+
+            def run_one(**kwargs):
+                calls.append((kwargs["mode"], kwargs["label"]))
+                return _run("prefill_latency_ms", (2.0, 1.0))
+
+            with (
+                mock.patch.object(
+                    benchmark,
+                    "_git_identity",
+                    return_value={"execution_tree_sha256": "fixture"},
+                ),
+                mock.patch.object(
+                    benchmark, "_python_environment_identity", return_value={}
+                ),
+                mock.patch.object(
+                    benchmark, "_generate_kernel_allowlist", return_value=("kernel",)
+                ),
+                mock.patch.object(benchmark, "_run_one", side_effect=run_one),
+                mock.patch("builtins.print"),
+            ):
+                for profiles in (PROFILE_IDS, ("default", "default-high")):
+                    calls.clear()
+                    selection = (
+                        []
+                        if profiles == PROFILE_IDS
+                        else [arg for mode in profiles for arg in ("--profile", mode)]
+                    )
+                    self.assertEqual(
+                        benchmark._main([*common, *selection, "--resume"]), 0
+                    )
+                    self.assertEqual(
+                        calls,
+                        [
+                            (None, "kernel-inventory"),
+                            (None, "native-reference-1"),
+                            (None, "native-reference-2"),
+                            *((mode, f"{mode}--audit-on") for mode in profiles),
+                            (None, "native-validation"),
+                        ],
+                    )
+                    summary = json.loads((root / "summary.json").read_text())
+                    self.assertEqual(summary["selected_profiles"], list(profiles))
+                    self.assertEqual(
+                        set(summary["workloads"][0]["modes"]), set(profiles)
+                    )
+                    progress = json.loads((root / "progress.json").read_text())[
+                        "projection"
+                    ]
+                    self.assertEqual(
+                        set(progress["workloads"][0]["modes"]), set(profiles)
+                    )
+                    if "supercollider" not in profiles:
+                        self.assertIn(
+                            "not selected", benchmark._render_status(progress)
+                        )
+
+    def test_profile_selection_defaults_to_all_and_rejects_unknown_profiles(
+        self,
+    ) -> None:
+        common = ["--target", "gfx1100", "--output-dir", "/output"]
+        self.assertIsNone(benchmark._parse_args(common).profile)
+        with self.assertRaises(SystemExit), mock.patch("sys.stderr"):
+            benchmark._parse_args([*common, "--profile", "unknown"])
+
     def test_source_identity_tracks_dirty_code_but_not_markdown_or_commit_bookkeeping(
         self,
     ) -> None:

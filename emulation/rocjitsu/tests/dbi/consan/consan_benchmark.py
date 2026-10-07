@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Benchmark bounded Aorta workloads natively and under every ConSan mode."""
+"""Benchmark bounded Aorta workloads natively and under selected ConSan profiles."""
 
 from __future__ import annotations
 
@@ -270,6 +270,12 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         choices=tuple(workload.id for workload in WORKLOADS + GFX950_ADDITIONS),
         action="append",
         help="run only this workload (repeatable)",
+    )
+    parser.add_argument(
+        "--profile",
+        choices=PROFILE_IDS,
+        action="append",
+        help="run only this instrumented profile (repeatable; default: all)",
     )
     return parser.parse_args(argv)
 
@@ -960,8 +966,7 @@ def _summarize_workload(
     }
     if "parameter_count" in payload_metrics:
         result["parameter_count"] = payload_metrics["parameter_count"]
-    for mode in PROFILE_IDS:
-        run = modes[mode]
+    for mode, run in modes.items():
         mode_result = _summarize_mode(run, native_runtime)
         if mode_result.get("applicable") is not False:
             mode_result["latency_ms"] = [
@@ -1029,7 +1034,11 @@ def _render_status(summary: dict[str, Any]) -> str:
         for mode in columns:
             result = workload["modes"].get(mode)
             if result is None:
-                state = workload.get("cell_states", {}).get(mode, "pending")
+                state = (
+                    "not selected"
+                    if mode not in summary.get("selected_profiles", PROFILE_IDS)
+                    else workload.get("cell_states", {}).get(mode, "pending")
+                )
                 cells.extend((state, state))
             elif result.get("applicable") is False:
                 cells.extend(("N/A (no applicable sites)", "N/A (no applicable sites)"))
@@ -1061,6 +1070,9 @@ def _atomic_write(path: Path, text: str) -> None:
 
 def _main(argv: list[str]) -> int:
     args = _parse_args(argv)
+    selected_profiles = tuple(
+        mode for mode in PROFILE_IDS if args.profile is None or mode in args.profile
+    )
     if args.aorta_dir is None:
         raise BenchmarkError(f"set ${AORTA_DIR_ENV} or pass --aorta-dir")
     args.aorta_dir = args.aorta_dir.resolve()
@@ -1176,6 +1188,7 @@ def _main(argv: list[str]) -> int:
     suite_start = time.perf_counter()
     status_projection = {
         "target": args.target,
+        "selected_profiles": list(selected_profiles),
         "workloads": [
             {
                 "id": workload.id,
@@ -1202,6 +1215,11 @@ def _main(argv: list[str]) -> int:
         workload = next((w for w in selected if w.id == row["id"]), None)
         if workload is not None:
             row["identity"] = _workload_identity(args.run_identity, workload)
+            row["modes"] = {
+                mode: result
+                for mode, result in row["modes"].items()
+                if mode in selected_profiles
+            }
     args.status_projection = status_projection
     _write_progress(args)
     status_rows = {
@@ -1240,7 +1258,7 @@ def _main(argv: list[str]) -> int:
         status_rows[workload.id]["native"] = {"runtime_ms": list(native_runtime)}
         _write_progress(args)
         modes: dict[str, dict[str, Any]] = {}
-        for mode in PROFILE_IDS:
+        for mode in selected_profiles:
             modes[mode] = _run_one(
                 args=args,
                 workload=workload,
@@ -1276,6 +1294,7 @@ def _main(argv: list[str]) -> int:
     summary = {
         "schema_version": SCHEMA_VERSION,
         "target": args.target,
+        "selected_profiles": list(selected_profiles),
         "audit_sites": args.audit_sites,
         "completed_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "suite_wall_seconds": suite_seconds,

@@ -25,9 +25,11 @@ and are not portable download links.
 
 ## Measurement contract
 
-The runner executes a native baseline, Default Mode with the default preset,
-Default Mode with `RJ_CONSAN_PRESET=high`, and SuperCollider on one physical
-GPU. GPU work must be serialized: do not run two cells concurrently, and use
+By default, the runner executes a native baseline, Default Mode with the default
+preset, Default Mode with `RJ_CONSAN_PRESET=high`, and SuperCollider on one physical
+GPU. Select a subset with repeatable `--profile` options; native discovery,
+references, and final drift validation always run. GPU work must be serialized:
+do not run two cells concurrently, and use
 `-j1` if the surrounding test driver has a job-count option. Each cell runs in a
 fresh process and performs the same bounded, synchronized operation twice.
 Every admitted cell must:
@@ -82,11 +84,20 @@ python3 tests/dbi/consan/consan_benchmark.py \
 hipBLASLt argument only when the selected target corpus has no hipBLASLt cell.
 Use `--workload ID` repeatedly for a focused run. Use `--resume` after an
 interruption; a cell is reused only when its complete input fingerprint matches.
+Use `--profile default --profile default-high` for a Default-only campaign.
+Available profiles are `default`, `default-high`, and `supercollider`. Omitted
+profiles are shown as not selected, and summaries contain only the selected
+profiles for each executed workload. Resuming with a different selection keeps
+the per-cell fingerprint checks; selection alone cannot reuse incompatible data.
 
 Before accepting results on a new host, confirm that all binaries and Python
 libraries resolve to the intended local ROCm installation and that the reported
 GPU target matches `--target`. Do not substitute an emulator for the physical
 benchmark GPU.
+Split TheRock PyTorch wheels also require the matching device extra, such as
+`torch[device-gfx1100]`, at the same pinned PyTorch version. Confirm that a GPU
+tensor operation executes; importing PyTorch and enumerating the GPU alone do
+not establish that its target-specific kernels are installed.
 
 ## Exact two-pass allowlist workflow
 
@@ -129,8 +140,8 @@ For each workload, use this order:
 1. `rocprofv3` native kernel-inventory pass and allowlist conversion;
 2. two native timing processes, each containing Run1 and Run2, used immediately
    to establish a separate median for each run ordinal;
-3. Default Mode (`RJ_CONSAN_PRESET=default`), Default Mode
-   (`RJ_CONSAN_PRESET=high`), and SuperCollider, updating the target status row
+3. the selected profiles in the order Default Mode (`RJ_CONSAN_PRESET=default`),
+   Default Mode (`RJ_CONSAN_PRESET=high`), and SuperCollider, updating the target status row
    after each completed configuration; and
 4. one final native timing sample used only as a post-validation drift check.
 
