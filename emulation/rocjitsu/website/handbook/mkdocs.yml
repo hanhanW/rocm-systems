@@ -76,6 +76,7 @@ nav:
       - Command-line interface: rocjitsu-cli.md
       - Configuration: configuration.md
       - Race detection: race-detector.md
+      - Native LDS ConSan: consan.md
       - GPU debugging: rocgdb-debugging.md
       - Benchmarking: benchmarking.md
       - QEMU VFIO-user compute: qemu-vfio.md
