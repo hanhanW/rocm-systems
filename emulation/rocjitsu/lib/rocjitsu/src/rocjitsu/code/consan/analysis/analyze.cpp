@@ -46,6 +46,7 @@ FailureOr<LdsRaceResult> analyze_capture(const Capture &capture, const AnalysisO
   result.execution_conditions = capture.header.execution_conditions;
   result.target = capture.header.manifest.target;
   result.wave_size = capture.header.manifest.wave_size;
+  result.scope = capture.header.manifest.scope;
   result.coverage_complete = !capture.executions.empty();
   for (const CapturedExecution &execution : capture.executions) {
     LdsRaceExecutionResult analyzed =

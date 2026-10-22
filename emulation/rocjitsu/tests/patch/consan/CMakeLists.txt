@@ -399,6 +399,21 @@ if(TARGET consan_hsa_runner)
                 )
             endforeach()
             if(RJ_BUILD_CONSAN_ANALYZER)
+                if(_gpu STREQUAL "gfx1250")
+                    foreach(
+                        _barrier_case
+                        IN
+                        ITEMS
+                            barrier
+                            barrier_empty
+                            barrier_high
+                            barrier_separated
+                    )
+                        consan_add_target_e2e(${_environment} ${_gpu} ${_wave} assembly
+                            ${_barrier_case} 65 production analysis
+                        )
+                    endforeach()
+                endif()
                 foreach(_scenario IN LISTS _named_analysis_cases)
                     consan_add_target_e2e(${_environment} ${_gpu} ${_wave} named-assembly
                         ${_scenario} ${_threads} testable analysis

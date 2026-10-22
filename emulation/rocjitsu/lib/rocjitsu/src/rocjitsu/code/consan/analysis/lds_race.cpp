@@ -5,6 +5,7 @@
 #include "rocjitsu/code/consan/encoding.h"
 
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <map>
 #include <set>
@@ -39,7 +40,8 @@ struct SiteGroup {
 
 void read_wave(const Manifest &facts, const CapturedExecution &execution,
                const LaunchLayout &layout, uint32_t wave, LdsRaceExecutionResult &result,
-               std::vector<Observation> &observations) {
+               std::vector<Observation> &observations,
+               std::vector<std::optional<uint32_t>> &completions) {
   const std::span<const uint8_t> row =
       std::span(execution.report)
           .subspan(kReportHeaderBytes + wave * layout.row_stride, layout.row_stride);
@@ -57,6 +59,20 @@ void read_wave(const Manifest &facts, const CapturedExecution &execution,
     issue(result, wave, UINT32_MAX, "invalid_row_identity_status_or_sequence");
     return;
   }
+  if (facts.barrier) {
+    const uint32_t sequence = *wire::read_u32(row, wire::kRowBarrierSequence);
+    if (wire::read_u32(row, wire::kRowBarrierCommit) == wire::kBarrierCompleted &&
+        wire::read_u32(row, wire::kRowBarrierGroup) == 0 &&
+        wire::read_u32(row, wire::kRowBarrierOccurrence) == 1 &&
+        wire::read_u32(row, wire::kRowBarrierParticipants) == layout.wave_count &&
+        sequence <= final) {
+      completions[wave] = sequence;
+      ++result.completed_barrier_waves;
+    } else
+      issue(result, wave, UINT32_MAX, "missing_or_invalid_barrier_completion");
+  } else if (!all_zero(row.subspan(wire::kRowBarrierCommit,
+                                   wire::kRowReservedBegin - wire::kRowBarrierCommit)))
+    issue(result, wave, UINT32_MAX, "unexpected_barrier_completion");
   result.lost_occurrences += loss;
   if (loss != 0)
     issue(result, wave, UINT32_MAX, "range_reservation_exhausted");
@@ -158,30 +174,133 @@ struct Bucket {
   std::map<uint32_t, Wave> waves;
 };
 
+struct BarrierPosition {
+  bool before, boundary_valid;
+};
+
+constexpr std::array<BarrierPosition, 4> kBarrierPositions = {
+    {{true, false}, {true, true}, {false, false}, {false, true}}};
+
+size_t barrier_position(const Manifest &facts, const LdsRaceParticipant &participant,
+                        std::span<const std::optional<uint32_t>> completions, bool complete) {
+  const bool before = participant.original_offset < facts.barrier->original_signal;
+  const bool valid =
+      complete && ((participant.sequence <= *completions[participant.wave]) == before);
+  return (before ? 0u : 2u) + uint32_t{valid};
+}
+
+LdsRaceOrdering ordering(size_t first, size_t second) {
+  if (kBarrierPositions[first].before == kBarrierPositions[second].before)
+    return LdsRaceOrdering::Unordered;
+  return kBarrierPositions[first].boundary_valid && kBarrierPositions[second].boundary_valid
+             ? LdsRaceOrdering::Ordered
+             : LdsRaceOrdering::Incomplete;
+}
+
+struct ObservationCounts {
+  uint64_t count = 0, lanes = 0;
+};
+
+void count_pairs(const ObservationCounts &first, const ObservationCounts &second,
+                 LdsRaceOrdering order, LdsRaceExecutionResult &result) {
+  const uint64_t pairs = first.count * second.count;
+  if (pairs == 0)
+    return;
+  if (order == LdsRaceOrdering::Ordered) {
+    result.ordered_pairs += pairs;
+    return;
+  }
+  result.cross_wave_pairs += pairs;
+  result.cross_wave_lane_pairs += first.lanes * second.lanes;
+  if (order == LdsRaceOrdering::Incomplete) {
+    result.ordering_unresolved_pairs += pairs;
+    result.coverage_complete = false;
+    result.ordering_uncertain = true;
+  }
+}
+
 void compare(const std::vector<const Observation *> &first,
              const std::vector<const Observation *> &second, uint32_t examples,
-             LdsRaceExecutionResult &result) {
+             const Manifest &facts, std::span<const std::optional<uint32_t>> completions,
+             bool complete, LdsRaceExecutionResult &result) {
   if (first.empty() || second.empty())
     return;
-  result.cross_wave_pairs += uint64_t{first.size()} * second.size();
-  uint64_t first_lanes = 0, second_lanes = 0;
-  for (const Observation *observation : first)
-    first_lanes += observation->lanes();
-  for (const Observation *observation : second)
-    second_lanes += observation->lanes();
-  result.cross_wave_lane_pairs += first_lanes * second_lanes;
-  if (second.empty())
+  if (!facts.barrier) {
+    result.cross_wave_pairs += uint64_t{first.size()} * second.size();
+    uint64_t first_lanes = 0, second_lanes = 0;
+    for (const Observation *observation : first)
+      first_lanes += observation->lanes();
+    for (const Observation *observation : second)
+      second_lanes += observation->lanes();
+    result.cross_wave_lane_pairs += first_lanes * second_lanes;
+    for (const Observation *first_observation : first)
+      for (const Observation *second_observation : second) {
+        if (result.cross_wave_examples.size() >= examples)
+          return;
+        result.cross_wave_examples.push_back(
+            {LdsRaceFindingKind::CrossWave, first_observation->participant,
+             second_observation->participant,
+             uint64_t{first_observation->lanes()} * second_observation->lanes(),
+             LdsRaceOrdering::Unordered});
+      }
     return;
+  }
+
+  // A fixed barrier's outcome depends only on each endpoint's static side and
+  // validated dynamic boundary. Count class products instead of visiting pairs.
+  std::array<ObservationCounts, kBarrierPositions.size()> first_counts{}, second_counts{};
+  std::array<std::vector<size_t>, kBarrierPositions.size()> second_indices;
+  for (const Observation *observation : first) {
+    ObservationCounts &counts =
+        first_counts[barrier_position(facts, observation->participant, completions, complete)];
+    ++counts.count;
+    counts.lanes += observation->lanes();
+  }
+  for (size_t index = 0; index < second.size(); ++index) {
+    const Observation &observation = *second[index];
+    const size_t position = barrier_position(facts, observation.participant, completions, complete);
+    ++second_counts[position].count;
+    second_counts[position].lanes += observation.lanes();
+    second_indices[position].push_back(index);
+  }
+  for (size_t first_position = 0; first_position < kBarrierPositions.size(); ++first_position)
+    for (size_t second_position = 0; second_position < kBarrierPositions.size(); ++second_position)
+      count_pairs(first_counts[first_position], second_counts[second_position],
+                  ordering(first_position, second_position), result);
+
+  // Merge eligible class indices to retain the original nested-loop example
+  // order, skipping exhausted outcomes without scanning their candidate pairs.
   for (const Observation *first_observation : first) {
-    if (result.cross_wave_examples.size() >= examples)
-      break;
-    for (const Observation *second_observation : second) {
-      if (result.cross_wave_examples.size() >= examples)
+    if (result.ordered_examples.size() >= examples && result.cross_wave_examples.size() >= examples)
+      return;
+    const size_t first_position =
+        barrier_position(facts, first_observation->participant, completions, complete);
+    std::array<size_t, kBarrierPositions.size()> cursors{};
+    for (;;) {
+      size_t next_index = second.size(), selected = kBarrierPositions.size();
+      for (size_t position = 0; position < kBarrierPositions.size(); ++position) {
+        const std::vector<size_t> &indices = second_indices[position];
+        const LdsRaceOrdering order = ordering(first_position, position);
+        const size_t retained = order == LdsRaceOrdering::Ordered
+                                    ? result.ordered_examples.size()
+                                    : result.cross_wave_examples.size();
+        if (retained < examples && cursors[position] < indices.size() &&
+            indices[cursors[position]] < next_index) {
+          next_index = indices[cursors[position]];
+          selected = position;
+        }
+      }
+      if (selected == kBarrierPositions.size())
         break;
-      result.cross_wave_examples.push_back(
-          {LdsRaceFindingKind::CrossWave, first_observation->participant,
-           second_observation->participant,
-           uint64_t{first_observation->lanes()} * second_observation->lanes()});
+      const Observation &second_observation = *second[next_index];
+      const LdsRaceOrdering order = ordering(first_position, selected);
+      LdsRaceFinding finding{LdsRaceFindingKind::CrossWave, first_observation->participant,
+                             second_observation.participant,
+                             uint64_t{first_observation->lanes()} * second_observation.lanes(),
+                             order};
+      (order == LdsRaceOrdering::Ordered ? result.ordered_examples : result.cross_wave_examples)
+          .push_back(finding);
+      ++cursors[selected];
     }
   }
 }
@@ -208,8 +327,12 @@ LdsRaceExecutionResult analyze_lds_race_execution(const Manifest &facts,
     return result;
   }
   std::vector<Observation> observations;
+  std::vector<std::optional<uint32_t>> completions(layout.value().wave_count);
+  if (facts.barrier)
+    result.required_barrier_waves = layout.value().wave_count;
   for (uint32_t wave = 0; wave < layout.value().wave_count; ++wave)
-    read_wave(facts, execution, layout.value(), wave, result, observations);
+    read_wave(facts, execution, layout.value(), wave, result, observations, completions);
+  const bool complete = result.completed_barrier_waves == layout.value().wave_count;
   result.valid_observations = observations.size();
   std::map<uint32_t, Bucket> words;
   for (const Observation &observation : observations) {
@@ -233,9 +356,9 @@ LdsRaceExecutionResult analyze_lds_race_execution(const Manifest &facts,
     std::vector<const Observation *> prior_reads, prior_writes;
     for (const auto &[wave, accesses] : bucket.waves) {
       (void)wave;
-      compare(prior_writes, accesses.writes, examples, result);
-      compare(prior_writes, accesses.reads, examples, result);
-      compare(prior_reads, accesses.writes, examples, result);
+      compare(prior_writes, accesses.writes, examples, facts, completions, complete, result);
+      compare(prior_writes, accesses.reads, examples, facts, completions, complete, result);
+      compare(prior_reads, accesses.writes, examples, facts, completions, complete, result);
       prior_writes.insert(prior_writes.end(), accesses.writes.begin(), accesses.writes.end());
       prior_reads.insert(prior_reads.end(), accesses.reads.begin(), accesses.reads.end());
     }

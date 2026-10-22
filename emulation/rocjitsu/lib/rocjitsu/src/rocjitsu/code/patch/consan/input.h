@@ -69,6 +69,7 @@ struct InputProgram {
   DbiEntryProloguePlan entry_plan;
   std::vector<OriginalInstruction> instructions;
   std::vector<NativeLdsAccess> accesses;
+  std::optional<BarrierFacts> barrier;
 };
 
 /// @brief Build an owning, qualified input program for the native LDS b32 MVP.

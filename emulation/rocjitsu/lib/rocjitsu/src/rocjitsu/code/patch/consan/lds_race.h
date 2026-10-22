@@ -37,9 +37,15 @@ struct LdsRaceProbePlan {
   uint32_t sgprs = 0;
   uint32_t vgprs = 0;
   uint32_t row_stride = 0;
+  bool barrier = false;
 };
 
 /// @brief Qualify LDS scope and select sites without owning binary/CFG machinery.
+[[nodiscard]] Result qualify_lds_race_barrier(InputProgram &program,
+                                              std::span<BasicBlock *const> blocks,
+                                              InputError &error);
+[[nodiscard]] Result emit_lds_race_barrier(std::vector<uint8_t> &text, const LdsRaceProbePlan &plan,
+                                           InputError &error);
 [[nodiscard]] Result qualify_lds_race_entry(const InputProgram &program, InputError &error);
 [[nodiscard]] Result qualify_lds_race_block(const BasicBlock &block, InputError &error);
 [[nodiscard]] Result classify_lds_race_instruction(const Instruction &instruction,

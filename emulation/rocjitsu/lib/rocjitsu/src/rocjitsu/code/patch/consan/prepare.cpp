@@ -67,6 +67,10 @@ FailureOr<PreparedArtifact> lower(const InputProgram &program, InputError &error
   std::vector<TextOffsetRelocation> relocations;
   PreparedArtifact artifact;
   Manifest &manifest = artifact.manifest;
+  if (program.barrier) {
+    manifest.scope = ScopeKind::NativeLdsWorkgroupBarrier;
+    manifest.barrier = program.barrier;
+  }
   std::vector<NativeLdsAccess>::const_iterator access = program.accesses.begin();
   // Internal branches land before a target instruction's observation probe.
   // External entry relocation additionally includes the common bootstrap.
@@ -86,7 +90,18 @@ FailureOr<PreparedArtifact> lower(const InputProgram &program, InputError &error
       return Result::failure();
     if (instruction.branch_target)
       branches.emplace_back(text.size(), *instruction.branch_target);
+    if (manifest.barrier && instruction.offset == manifest.barrier->original_signal)
+      manifest.barrier->prepared_signal = text.size();
+    if (manifest.barrier && instruction.offset == manifest.barrier->original_wait)
+      manifest.barrier->prepared_wait = text.size();
     append_words(text, instruction.words);
+    if (manifest.barrier && instruction.offset == manifest.barrier->original_wait) {
+      manifest.barrier->completion_probe = text.size();
+      if (emit_lds_race_barrier(text, plan, error).failed())
+        return Result::failure();
+      manifest.barrier->probe_size =
+          static_cast<uint32_t>(text.size() - manifest.barrier->completion_probe);
+    }
   }
   // Resolve guest transfers only after every destination has its final offset.
   relocations.push_back({program.text_bytes, text.size()});

@@ -362,11 +362,32 @@ public:
     std::memcpy(text_.data() + branch_offset, &original, 4);
     return true;
   }
-  void entry(uint32_t row_stride) {
+  void barrier() {
+    save();
+    publish_lane();
+    store_immediate(wire::kRowBarrierGroup, 0);
+    store_immediate(wire::kRowBarrierOccurrence, 1);
+    store(wire::kRowBarrierParticipants, scalar_ + 21);
+    store(wire::kRowBarrierSequence, scalar_ + 15);
+    wait_stores();
+    store_immediate(wire::kRowBarrierCommit, wire::kBarrierCompleted);
+    wait_stores();
+    restore();
+  }
+  void entry(uint32_t row_stride, bool barrier) {
     save();
     emit(build_s_load_dwordx2(scalar_ + 2, scalar_, wire::kContextSerial, arch_));
     emit(build_s_load_dwordx2(scalar_ + 18, scalar_, wire::kContextReportPointer, arch_));
+    if (barrier)
+      emit(cdna5::build_smem(cdna5::kSLoadB32Smem, {.sbase = uint8_t(scalar_ / 2),
+                                                    .sdata = uint8_t(scalar_ + 21),
+                                                    .ioffset = wire::kContextWorkgroup,
+                                                    .soffset = cdna5::OPR_SMEM_OFFSET_NULL}));
     word(build_wait_scalar_loads_complete(arch_));
+    if (barrier) {
+      binary(ScalarOp::Add, scalar_ + 21, scalar_ + 21, kZero + 31);
+      binary(ScalarOp::ShiftRight, scalar_ + 21, scalar_ + 21, kZero + 5);
+    }
     pair(scalar_, scalar_ + 18);
     read_first(scalar_ + 20, 0);
     binary(ScalarOp::ShiftRight, scalar_ + 20, scalar_ + 20, kZero + (wave_size_ == 64 ? 6 : 5));
@@ -513,6 +534,8 @@ Result classify_lds_race_instruction(const Instruction &instruction, rj_code_arc
                                      std::vector<NativeLdsAccess> &accesses, InputError &error) {
   const std::string_view name = instruction.mnemonic();
   const uint64_t offset = instruction.src_loc();
+  if (arch == ROCJITSU_CODE_ARCH_CDNA5 && (name == "s_barrier_signal" || name == "s_barrier_wait"))
+    return Result::success(); // The complete original group/CFG is qualified below.
   if ((instruction.flags() & BARRIER) != 0 || name.find("atomic") != std::string_view::npos ||
       name.starts_with("s_barrier") || name.starts_with("s_sendmsg"))
     return reject_instruction(error, InputErrorCode::UnsupportedSynchronization,
@@ -551,6 +574,83 @@ Result classify_lds_race_instruction(const Instruction &instruction, rj_code_arc
   return Result::success();
 }
 
+Result qualify_lds_race_barrier(InputProgram &program, std::span<BasicBlock *const> blocks,
+                                InputError &error) {
+  const BasicBlock *barrier_block = nullptr;
+  uint32_t members = 0;
+  for (BasicBlock *block : blocks) {
+    std::vector<const Instruction *> instructions;
+    for (const Instruction &instruction : block->instructions()) {
+      instructions.push_back(&instruction);
+      if (instruction.mnemonic() == "s_barrier_signal" ||
+          instruction.mnemonic() == "s_barrier_wait")
+        ++members;
+    }
+    for (size_t index = 0; index < instructions.size(); ++index) {
+      if (instructions[index]->mnemonic() != "s_barrier_signal")
+        continue;
+      const uint32_t signal =
+          cdna5::build_sop1(cdna5::kSBarrierSignalSop1, {.ssrc0 = cdna5::OPR_SSRC_NEG_INT_MIN})[0];
+      const uint32_t wait =
+          build_sopp_encoding(ROCJITSU_CODE_ARCH_CDNA5, cdna5::kSBarrierWaitSopp, 0xffff);
+      const uint32_t drain =
+          build_sopp_encoding(ROCJITSU_CODE_ARCH_CDNA5, cdna5::kSWaitDscntSopp, 0);
+      size_t wait_index = index + 1;
+      bool intervening_memory = false;
+      while (wait_index < instructions.size() &&
+             instructions[wait_index]->mnemonic() != "s_barrier_wait") {
+        const std::string_view name = instructions[wait_index]->mnemonic();
+        if (name.starts_with("ds_") || name.starts_with("global_") || name.starts_with("s_load"))
+          intervening_memory = true;
+        ++wait_index;
+      }
+      if (program.target->id != 1250 || program.wave_size != 32 || barrier_block != nullptr ||
+          index == 0 || wait_index == instructions.size() || intervening_memory ||
+          instructions[index - 1]->size() != 4 || instructions[index]->size() != 4 ||
+          instructions[wait_index]->size() != 4 ||
+          instructions[index - 1]->raw_encoding()[0] != drain ||
+          instructions[index]->raw_encoding()[0] != signal ||
+          instructions[wait_index]->raw_encoding()[0] != wait)
+        return reject_instruction(
+            error, InputErrorCode::UnsupportedSynchronization,
+            "requires one original LDS drain/signal -1/wait -1 group without intervening memory",
+            instructions[index]->src_loc());
+      barrier_block = block;
+      program.barrier = BarrierFacts{.original_drain = instructions[index - 1]->src_loc(),
+                                     .original_signal = instructions[index]->src_loc(),
+                                     .original_wait = instructions[wait_index]->src_loc()};
+    }
+  }
+  if (members == 0)
+    return Result::success();
+  if (members != 2 || barrier_block == nullptr)
+    return reject_instruction(error, InputErrorCode::UnsupportedSynchronization,
+                              "incomplete or repeated workgroup barrier group");
+  // In this closed forward CFG, deleting the group block must leave no path
+  // from the hardware entry to an exit. This also rejects divergent bypasses;
+  // scalar barriers themselves execute independently of the current EXEC.
+  const auto entry =
+      std::ranges::find(blocks, program.kernel.entry_text_offset, &BasicBlock::start_offset);
+  if (entry == blocks.end())
+    return reject_instruction(error, InputErrorCode::UnsupportedSynchronization,
+                              "missing barrier entry");
+  std::vector<const BasicBlock *> pending{*entry};
+  std::set<const BasicBlock *> visited;
+  while (!pending.empty()) {
+    const BasicBlock *block = pending.back();
+    pending.pop_back();
+    if (block == barrier_block || !visited.insert(block).second)
+      continue;
+    if (block->successors().empty())
+      return reject_instruction(error, InputErrorCode::UnsupportedSynchronization,
+                                "workgroup barrier does not converge on every exit",
+                                block->start_offset());
+    for (const BasicBlock *successor : block->successors())
+      pending.push_back(successor);
+  }
+  return Result::success();
+}
+
 FailureOr<LdsRaceProbePlan> plan_lds_race_probes(const InputProgram &program, InputError &error) {
   assert(program.target != nullptr && "qualified input requires a target");
   assert(
@@ -578,13 +678,14 @@ FailureOr<LdsRaceProbePlan> plan_lds_race_probes(const InputProgram &program, In
                           .vector_base = vector_base,
                           .sgprs = sgprs,
                           .vgprs = vgprs,
-                          .row_stride = static_cast<uint32_t>(stride)};
+                          .row_stride = static_cast<uint32_t>(stride),
+                          .barrier = program.barrier.has_value()};
 }
 
 Result emit_lds_race_entry(std::vector<uint8_t> &text, const LdsRaceProbePlan &plan,
                            InputError &error) {
   ProbeEmitter emitter = make_probe_emitter(text, plan);
-  emitter.entry(plan.row_stride);
+  emitter.entry(plan.row_stride, plan.barrier);
   if (!emitter.valid())
     return reject(error, "selected architecture has no native LDS probe lowering");
   return Result::success();
@@ -610,6 +711,15 @@ FailureOr<SiteFacts> emit_lds_race_access(std::vector<uint8_t> &text, const LdsR
                    .first_slot = access.site * kAddressGroupsPerSite};
 }
 
+Result emit_lds_race_barrier(std::vector<uint8_t> &text, const LdsRaceProbePlan &plan,
+                             InputError &error) {
+  ProbeEmitter emitter = make_probe_emitter(text, plan);
+  emitter.barrier();
+  if (!emitter.valid())
+    return reject(error, "selected architecture has no workgroup barrier probe lowering");
+  return Result::success();
+}
+
 Result emit_lds_race_exit(std::vector<uint8_t> &text, const LdsRaceProbePlan &plan,
                           InputError &error) {
   ProbeEmitter emitter = make_probe_emitter(text, plan);
@@ -622,14 +732,26 @@ Result emit_lds_race_exit(std::vector<uint8_t> &text, const LdsRaceProbePlan &pl
 Result validate_lds_race_accesses(const InputProgram &program, const PreparedArtifact &artifact,
                                   std::span<BasicBlock *const> blocks,
                                   std::span<const uint8_t> prepared_text, InputError &error) {
+  std::set<uint64_t> barrier_offsets;
   std::set<uint64_t> access_offsets;
   for (BasicBlock *block : blocks)
     for (const Instruction &instruction : block->instructions()) {
       const std::string_view name = instruction.mnemonic();
+      if (name == "s_barrier_signal" || name == "s_barrier_wait")
+        barrier_offsets.insert(instruction.src_loc());
       if (name == "ds_load_b32" || name == "ds_store_b32" || name == "ds_read_b32" ||
           name == "ds_write_b32")
         access_offsets.insert(instruction.src_loc());
     }
+  if (artifact.manifest.barrier) {
+    const BarrierFacts &barrier = *artifact.manifest.barrier;
+    if (barrier_offsets != std::set<uint64_t>{barrier.prepared_signal, barrier.prepared_wait} ||
+        std::memcmp(program.image.data() + program.text_file_offset + barrier.original_signal,
+                    prepared_text.data() + barrier.prepared_signal,
+                    barrier.original_wait + 4 - barrier.original_signal) != 0)
+      return reject(error, "final reachable barrier operations differ from original group");
+  } else if (!barrier_offsets.empty())
+    return reject(error, "unexpected final reachable barrier operation");
   if (access_offsets.size() != artifact.manifest.sites.size())
     return reject(error, "final reachable guest access multiplicity differs from original");
   for (const SiteFacts &site : artifact.manifest.sites)

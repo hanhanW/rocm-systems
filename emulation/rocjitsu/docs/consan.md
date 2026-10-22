@@ -155,8 +155,9 @@ observations for two checks:
 
 ### Analysis and admission
 
-Preparation accepts a limited instruction/access subset without relevant guest
-synchronization; unsupported forms, barriers, and atomics are rejected. Exact
+Preparation accepts a limited instruction/access subset with no synchronization,
+or one qualified full-workgroup barrier on **gfx1250 wave32**. Other barrier
+forms and atomics are rejected. Exact
 conditions are defined by [compiler qualification](../lib/rocjitsu/src/rocjitsu/code/patch/consan/lds_race.cpp)
 and [runtime admission](../lib/rocjitsu/src/rocjitsu/hooks/consan/hsa_plugin.cpp).
 
@@ -164,8 +165,36 @@ The input code object must contain exactly one kernel, matching the requested
 entry. Selecting an entry does not exclude sibling kernels from this requirement;
 provide a code object containing only the selected kernel.
 
+The barrier profile requires at least two waves in one complete 1D workgroup
+and a closed forward CFG. The original `s_wait_dscnt 0` must immediately precede
+`s_barrier_signal -1`; the matching `s_barrier_wait -1` must be in the same
+basic block. Admitted arithmetic may separate signal and wait; memory operations
+may not. That block must dominate every exit. Repeated occurrences, dynamic IDs,
+partial/cluster barriers, loops, and paths bypassing the group are unsupported.
+These rules are established from original instructions; probe waits provide no
+guest synchronization evidence.
+
+The unchanged guest wait executes once, then a probe records group 0,
+occurrence 1, the launch's required wave count, and its access-sequence boundary.
+Scalar completion is recorded even at guest EXEC=0. Every required wave,
+including waves with no retained ordinary accesses, must supply a valid completed
+row and matching witness. Static access positions and dynamic sequence boundaries
+must bracket a conflicting pair before it is `ordered`. The analyzer counts
+`ordered_pairs` and retains `ordered_examples`; zero findings alone is not a
+certificate. Pairs on the same side remain `unordered`. Missing or inconsistent
+required witnesses retain the candidate as `ordering_unresolved`, without
+suppressing an independently valid same-instruction store collision. Unrelated
+local access corruption does not revoke a complete certificate.
+
+Barrier facts are saved with original/prepared signal/wait positions and the
+after-wait probe mapping. The producer compatibility token and options identity
+cover these meanings, and incompatible artifacts/captures reject explicitly.
+The bounded certificate occupies existing row-header space, adding no report
+bytes or register reservation; preparation and execution still consume more
+instructions and time.
+
 Recording is bounded and does not provide a full execution history. Broader
-access forms, synchronization analysis, and application integration require
+access forms, synchronization forms, and application integration require
 extensions.
 
 ## How to use

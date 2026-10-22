@@ -68,6 +68,16 @@ int main(int argc, char **argv) {
                 << ",\"loss\":" << *wire::read_u32(execution.report, row + wire::kRowLoss)
                 << ",\"final_sequence\":"
                 << *wire::read_u32(execution.report, row + wire::kRowFinalSequence)
+                << ",\"barrier_commit\":"
+                << *wire::read_u32(execution.report, row + wire::kRowBarrierCommit)
+                << ",\"barrier_group\":"
+                << *wire::read_u32(execution.report, row + wire::kRowBarrierGroup)
+                << ",\"barrier_occurrence\":"
+                << *wire::read_u32(execution.report, row + wire::kRowBarrierOccurrence)
+                << ",\"barrier_participants\":"
+                << *wire::read_u32(execution.report, row + wire::kRowBarrierParticipants)
+                << ",\"barrier_sequence\":"
+                << *wire::read_u32(execution.report, row + wire::kRowBarrierSequence)
                 << ",\"records\":[";
       bool first_record = true;
       for (const SiteFacts &site : capture.header.manifest.sites) {

@@ -612,6 +612,30 @@ TEST_P(ConSanHipSim, CompiledHipRaceDisjointAndReadReadExecuteTheirNativeSites) 
   }
 }
 
+TEST_F(ConSanBootstrapSim, Gfx1250BarrierPreservesOutputAndGuestStateAtEmptyExecAndHighLanes) {
+  for (const char *fixture : {"native-15", "native-16", "native-20", "native-21"}) {
+    for (const uint32_t threads : {64u, 65u}) {
+      SCOPED_TRACE(fixture);
+      SCOPED_TRACE(threads);
+      RunResult before, after;
+      run(fixture, Bootstrap::None, before, {"gfx1250", 32}, threads, true);
+      ASSERT_FALSE(HasFatalFailure());
+      run(fixture, Bootstrap::Instrumented, after, {"gfx1250", 32}, threads, true);
+      ASSERT_FALSE(HasFatalFailure());
+      EXPECT_EQ(before.output[0], 7u);
+      EXPECT_EQ(after.output[0], 7u);
+      expect_guest_state(before, after);
+      const std::vector<ObservedAccess> records = published_accesses(after);
+      ASSERT_EQ(records.size(), 2u);
+      EXPECT_EQ(records[0].wave, 0u);
+      EXPECT_EQ(records[1].wave, 1u);
+      const uint64_t mask = std::string_view(fixture) == "native-20" ? uint64_t{1} << 31 : 1;
+      EXPECT_EQ(records[0].mask, mask);
+      EXPECT_EQ(records[1].mask, mask);
+    }
+  }
+}
+
 const auto target_name = [](const auto &info) {
   return std::string(info.param.target) + "Wave" + std::to_string(info.param.wave_size);
 };

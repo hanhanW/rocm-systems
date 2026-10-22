@@ -52,7 +52,11 @@ void write_examples(std::ostream &out, const std::vector<LdsRaceFinding> &findin
         << (finding.kind == LdsRaceFindingKind::CrossWave ? "cross_wave" : "instruction_collision")
         << "\",\"lane_pairs\":" << finding.lane_pairs;
     if (finding.kind == LdsRaceFindingKind::CrossWave)
-      out << ",\"ordering\":\"unordered\"";
+      out << ",\"ordering\":\""
+          << (finding.ordering == LdsRaceOrdering::Ordered      ? "ordered"
+              : finding.ordering == LdsRaceOrdering::Incomplete ? "ordering_unresolved"
+                                                                : "unordered")
+          << "\"";
     else
       out << ",\"reason\":\"ordinary_store_exact_mask\"";
     out << ",\"first\":";
@@ -74,10 +78,13 @@ std::string render_lds_race_analysis(const LdsRaceResult &result) {
   out << std::boolalpha;
   out << "{\"verdict\":\""
       << (result.cross_wave_pairs || result.collision_groups ? "findings" : "no_observed_findings")
-      << "\",\"scope\":\"native_lds_b32_no_sync_one_workgroup\"" << ",\"run_identity\":\""
-      << hex_bytes(result.run_identity) << "\",\"original_sha256\":\""
-      << hex_bytes(result.original.sha256) << "\",\"original_bytes\":" << result.original.bytes
-      << ",\"entry\":";
+      << "\",\"scope\":\""
+      << (result.scope == ScopeKind::NativeLdsWorkgroupBarrier
+              ? "native_lds_b32_fixed_workgroup_barrier"
+              : "native_lds_b32_no_sync_one_workgroup")
+      << "\"" << ",\"run_identity\":\"" << hex_bytes(result.run_identity)
+      << "\",\"original_sha256\":\"" << hex_bytes(result.original.sha256)
+      << "\",\"original_bytes\":" << result.original.bytes << ",\"entry\":";
   write_json_string(out, result.entry);
   out << ",\"target\":" << result.target << ",\"wave_size\":" << result.wave_size
       << ",\"execution_conditions\":" << result.execution_conditions
@@ -96,6 +103,10 @@ std::string render_lds_race_analysis(const LdsRaceResult &result) {
         << ",\"coverage_complete\":" << execution.coverage_complete
         << ",\"ordering_uncertain\":" << execution.ordering_uncertain
         << ",\"integrity_events\":" << execution.integrity_events
+        << ",\"ordered_pairs\":" << execution.ordered_pairs
+        << ",\"ordering_unresolved_pairs\":" << execution.ordering_unresolved_pairs
+        << ",\"required_barrier_waves\":" << execution.required_barrier_waves
+        << ",\"completed_barrier_waves\":" << execution.completed_barrier_waves
         << ",\"cross_wave_pairs\":" << execution.cross_wave_pairs
         << ",\"cross_wave_lane_pairs\":" << execution.cross_wave_lane_pairs
         << ",\"collision_groups\":" << execution.collision_groups
@@ -121,6 +132,8 @@ std::string render_lds_race_analysis(const LdsRaceResult &result) {
     }
     out << "],\"cross_wave_examples\":";
     write_examples(out, execution.cross_wave_examples);
+    out << ",\"ordered_examples\":";
+    write_examples(out, execution.ordered_examples);
     out << ",\"collision_examples\":";
     write_examples(out, execution.collision_examples);
     out << '}';

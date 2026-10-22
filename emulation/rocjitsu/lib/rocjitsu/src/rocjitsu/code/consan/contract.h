@@ -8,6 +8,7 @@
 
 #include <array>
 #include <cstdint>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -25,11 +26,12 @@ using Digest = std::array<uint8_t, 32>;
 // and internal API changes alone do not require a new token; no negotiation is
 // performed between producers and consumers.
 inline constexpr std::array<uint8_t, 16> kProducerContract = {
-    0x9a, 0x62, 0xb4, 0x31, 0x37, 0xe0, 0x4d, 0x6c, 0xae, 0x59, 0x71, 0x38, 0x02, 0x96, 0xf8, 0x42};
+    0x1b, 0xc7, 0x01, 0xa7, 0x49, 0xe2, 0x47, 0x1e, 0x84, 0xef, 0x49, 0xea, 0xa0, 0x0c, 0xf1, 0x83};
 // Canonical hash input for the manifest's options identity. Changing any byte
 // changes the identity required by artifact and capture admission.
 inline constexpr std::string_view kMvpOptions =
-    "native-lds-b32;no-sync;one-workgroup-1d;mask64;address-groups-per-site=4;collision=on";
+    "native-lds-b32;gfx1250-fixed-workgroup-barrier;one-workgroup-1d;mask64;address-groups-per-"
+    "site=4;collision=on";
 // Software record slots for distinct effective LDS address groups per wave/site.
 // Remaining lanes after these slots are filled cause one lost occurrence;
 // this reservation count is independent of the GPU's hardware LDS banks.
@@ -44,7 +46,7 @@ inline constexpr std::array<KernargExtensionPayloadLayout, 1> kContextPointerPay
 enum class AnalysisKind : uint32_t { Invalid = 0, LdsRaceDetection = 1 };
 enum class RecordKind : uint32_t { Access = 1 };
 enum class AccessKind : uint32_t { Read = 1, Write = 2 };
-enum class ScopeKind : uint32_t { NativeLdsNoSynchronization = 1 };
+enum class ScopeKind : uint32_t { NativeLdsNoSynchronization = 1, NativeLdsWorkgroupBarrier = 2 };
 
 /// @brief GPU wire offsets; consumers never serialize native C++ struct layout.
 namespace wire {
@@ -70,7 +72,13 @@ inline constexpr uint32_t kRowWave = 12;
 inline constexpr uint32_t kRowStatus = 16;
 inline constexpr uint32_t kRowLoss = 20;
 inline constexpr uint32_t kRowFinalSequence = 24;
-inline constexpr uint32_t kRowReservedBegin = 28;
+inline constexpr uint32_t kRowBarrierCommit = 28;
+inline constexpr uint32_t kRowBarrierGroup = 32;
+inline constexpr uint32_t kRowBarrierOccurrence = 36;
+inline constexpr uint32_t kRowBarrierParticipants = 40;
+inline constexpr uint32_t kRowBarrierSequence = 44;
+inline constexpr uint32_t kRowReservedBegin = 48;
+inline constexpr uint32_t kBarrierCompleted = 0x43534243;
 inline constexpr uint32_t kRowEntered = 1;
 inline constexpr uint32_t kRowExited = 2;
 inline constexpr uint32_t kRowExhausted = 4;
@@ -173,10 +181,28 @@ public:
   bool operator==(const EntryFacts &) const = default;
 };
 
+/// @brief One convergent gfx1250 wave32 workgroup barrier with implicit identity -1.
+/// @details The original drain precedes signal; signal/wait share a block without
+/// intervening memory, dominate all exits, and execute once per wave independently
+/// of EXEC. Completion is observed after
+/// the unchanged wait; access positions refer to original guest instructions.
+class BarrierFacts {
+public:
+  uint64_t original_drain = 0;
+  uint64_t original_signal = 0;
+  uint64_t original_wait = 0;
+  uint64_t prepared_signal = 0;
+  uint64_t prepared_wait = 0;
+  uint64_t completion_probe = 0;
+  uint32_t probe_size = 0;
+  uint32_t identity = UINT32_MAX;
+  bool operator==(const BarrierFacts &) const = default;
+};
+
 /// @brief Owning static handoff shared by AOT, runtime and offline readers.
 /// @details This subset admits one entry, dynamically sized wave rows, native LDS
-/// b32 Read/Write, no relevant synchronization, no private frame or segment
-/// addends. The compiler must establish the scope from original instructions.
+/// b32 Read/Write, an optional qualified fixed workgroup barrier, no private frame
+/// or segment addends. The compiler must establish the scope from original instructions.
 /// Codec validation establishes structural consistency, not ISA safety.
 class Manifest {
 public:
@@ -191,6 +217,7 @@ public:
   uint64_t prepared_text_bytes = 0;
   EntryFacts entry;
   std::vector<SiteFacts> sites;
+  std::optional<BarrierFacts> barrier;
   bool operator==(const Manifest &) const = default;
 };
 
