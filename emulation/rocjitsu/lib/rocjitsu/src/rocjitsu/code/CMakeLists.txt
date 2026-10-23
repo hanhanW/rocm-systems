@@ -79,6 +79,7 @@ rj_add_object_library(rocjitsu_code
     patch/sidecar_metadata.cpp
     dbt/waitcnt_translator.cpp
     patch/code_object_patcher.cpp
+    patch/checked_text_edits.cpp
     patch/entry_prologue.cpp
     patch/kernel_text_layout.cpp
     patch/log_buffer.cpp
