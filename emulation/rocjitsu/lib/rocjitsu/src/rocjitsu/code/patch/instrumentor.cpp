@@ -787,6 +787,24 @@ std::optional<Instrumentor::EntryProloguePatch> Instrumentor::plan_entry_prologu
     for (uint16_t reg = 0; reg < options_.register_growth->sgprs; ++reg)
       reserved.expand(RegisterRef{RegClass::SGPR, reg, 1});
 
+  // Reserve scalar sources before the wrapper prologue chooses its scratch:
+  // a requested entry input can otherwise be dead to the original guest CFG.
+  // CP inputs remain valid even when metadata counts only used registers.
+  const uint32_t scalar_bound =
+      options_.register_growth
+          ? std::max(options_.register_growth->sgprs,
+                     kernel_descriptor_initial_sgpr_count(arch_, kernel.descriptor))
+          : ordinary_sgpr_bound(arch_, *kernel_sgpr_count);
+  for (const InstrumentationPoint &point : points_)
+    for (const ProbeArgValue &arg : point.probe_args)
+      if (arg.source == ProbeArgSource::EntrySgpr) {
+        if (arg.register_index >= scalar_bound) {
+          report(error_out, "entry SGPR capture exceeds the original guest allocation");
+          return std::nullopt;
+        }
+        reserved.expand(RegisterRef{RegClass::SGPR, arg.register_index, 1});
+      }
+
   std::optional<DbiEntryProloguePlan> planned;
   if (probes_read_entry_storage(probes))
     planned = plan_dbi_entry_prologue(KernelBlockScope(scope), kernel.descriptor, arch_,
@@ -813,27 +831,39 @@ std::optional<Instrumentor::EntryProloguePatch> Instrumentor::plan_entry_prologu
   if (planned) {
     patch.storage_base = planned->storage.persistent_base;
     patch.words = planned->prologue.words;
-    const uint32_t bound = kernel_vgpr_bounds(arch_, kernel.descriptor).ordinary_bound;
-    std::vector<uint16_t> sources;
+    const uint32_t vector_bound = options_.register_growth
+                                      ? options_.register_growth->vgprs
+                                      : kernel_vgpr_bounds(arch_, kernel.descriptor).ordinary_bound;
+    std::vector<std::pair<RegClass, uint16_t>> sources;
     for (const InstrumentationPoint &point : points_)
-      for (const ProbeArgValue &arg : point.probe_args)
-        if (arg.source == ProbeArgSource::EntryVgprLane0 &&
-            std::ranges::find(sources, arg.register_index) == sources.end())
-          sources.push_back(arg.register_index);
+      for (const ProbeArgValue &arg : point.probe_args) {
+        if (arg.source != ProbeArgSource::EntryVgprLane0 && arg.source != ProbeArgSource::EntrySgpr)
+          continue;
+        const auto source =
+            std::pair{arg.source == ProbeArgSource::EntrySgpr ? RegClass::SGPR : RegClass::VGPR,
+                      arg.register_index};
+        if (std::ranges::find(sources, source) == sources.end())
+          sources.push_back(source);
+      }
     if (sources.size() > 2) {
-      report(error_out, "the entry snapshot has room for at most two lane-zero VGPR values");
+      report(error_out, "the entry snapshot has room for at most two register values");
       return std::nullopt;
     }
     for (size_t index = 0; index < sources.size(); ++index) {
-      if (sources[index] >= std::min(bound, 256u)) {
+      const auto [source_class, source_index] = sources[index];
+      if (source_class == RegClass::VGPR && source_index >= std::min(vector_bound, 256u)) {
         report(error_out, "entry VGPR capture exceeds the kernel's ordinary VGPR allocation");
         return std::nullopt;
       }
       const uint16_t destination = planned->storage.entry_temp_base + index;
-      const std::array<uint32_t, 2> words =
-          build_v_readlane_b32(destination, sources[index], 0, arch_);
-      patch.words.insert(patch.words.end(), words.begin(), words.end());
-      patch.captured_vgprs.push_back({sources[index], destination});
+      if (source_class == RegClass::SGPR) {
+        patch.words.push_back(build_s_mov_b32(destination, source_index, arch_));
+      } else {
+        const std::array<uint32_t, 2> words =
+            build_v_readlane_b32(destination, source_index, 0, arch_);
+        patch.words.insert(patch.words.end(), words.begin(), words.end());
+      }
+      patch.captured_registers.push_back({source_index, destination, source_class});
     }
   }
   const uint64_t branch_pc = patch.stub_offset + patch.words.size() * sizeof(uint32_t);
@@ -1431,7 +1461,7 @@ InstrumentedCodeObjectDebug Instrumentor::patch_with_debug_summaries() {
                                         uint32_t{*entry_storage_base} + kDbiEntryStorageRegisters);
       // Aligning entry storage can advance its snapshots past the initial
       // backup base when the original SGPR count is odd.
-      for (const EntryVgprCapture &capture : entry_patch->captured_vgprs)
+      for (const EntryRegisterCapture &capture : entry_patch->captured_registers)
         sgpr_save_base = std::max(sgpr_save_base, uint32_t{capture.sgpr} + 1);
     }
     cave_cursor = entry_patch->stub_offset + entry_patch->words.size() * sizeof(uint32_t);
@@ -1593,7 +1623,7 @@ InstrumentedCodeObjectDebug Instrumentor::patch_with_debug_summaries() {
       // has to stay off it everywhere.
       plan.entry_storage_base = entry_storage_base;
       if (entry_patch)
-        plan.entry_vgpr_captures = entry_patch->captured_vgprs;
+        plan.entry_register_captures = entry_patch->captured_registers;
       if (options_.register_growth) {
         const RegisterSet overwritten =
             (summary->ordinary_clobbers | arg_registers(probe.abi)) & live;

@@ -20,20 +20,34 @@ Result reject_instruction(InputError &error, InputErrorCode code, std::string me
   return Result::failure();
 }
 
-bool admitted_instruction(std::string_view name) {
+bool admitted_instruction(std::string_view name, rj_code_arch_t arch) {
+  if (arch == ROCJITSU_CODE_ARCH_CDNA5 && name == "s_mul_i32")
+    return true;
   constexpr std::array names = {
-      "s_load_dword",       "s_load_dwordx2",     "s_mov_b64",         "s_and_saveexec_b64",
-      "s_and_b64",          "s_or_b64",           "s_delay_alu",       "v_cmpx_eq_u32_e32",
-      "v_add_u32_e32",      "global_store_dword", "ds_read_b32",       "ds_write_b32",
-      "s_wait_kmcnt",       "s_wait_storecnt",    "s_wait_dscnt",      "s_wait_loadcnt_dscnt",
-      "s_wait_loadcnt",     "s_wait_xcnt",        "v_nop_e32",         "s_load_b32",
-      "s_load_b64",         "s_waitcnt",          "s_waitcnt_vscnt",   "s_mov_b32",
-      "s_and_saveexec_b32", "s_and_b32",          "s_or_b32",          "s_cmp_eq_u32",
-      "s_branch",           "s_cbranch_scc0",     "s_cbranch_scc1",    "s_cbranch_vccz",
-      "s_cbranch_vccnz",    "s_cbranch_execz",    "s_cbranch_execnz",  "s_nop",
-      "s_endpgm",           "v_mov_b32_e32",      "v_lshrrev_b32_e32", "v_lshlrev_b32_e32",
-      "v_add_nc_u32_e32",   "v_and_b32_e32",      "v_cmp_eq_u32_e32",  "v_cmp_gt_u32_e32",
-      "global_store_b32",   "ds_store_b32",       "ds_load_b32",
+      "s_load_dword",       "s_load_dwordx2",
+      "s_mov_b64",          "s_and_saveexec_b64",
+      "s_and_b64",          "s_or_b64",
+      "s_delay_alu",        "v_cmpx_eq_u32_e32",
+      "v_add_u32_e32",      "global_store_dword",
+      "s_wait_kmcnt",       "s_wait_storecnt",
+      "s_wait_dscnt",       "s_wait_loadcnt_dscnt",
+      "s_wait_loadcnt",     "s_wait_xcnt",
+      "v_nop_e32",          "s_load_b32",
+      "s_load_b64",         "s_waitcnt",
+      "s_waitcnt_vscnt",    "s_mov_b32",
+      "s_and_saveexec_b32", "s_and_b32",
+      "s_or_b32",           "s_cmp_eq_u32",
+      "s_add_u32",          "s_sub_u32",
+      "s_add_co_u32",       "s_sub_co_u32",
+      "s_branch",           "s_cbranch_scc0",
+      "s_cbranch_scc1",     "s_cbranch_vccz",
+      "s_cbranch_vccnz",    "s_cbranch_execz",
+      "s_cbranch_execnz",   "s_nop",
+      "s_endpgm",           "v_mov_b32_e32",
+      "v_lshrrev_b32_e32",  "v_lshlrev_b32_e32",
+      "v_add_nc_u32_e32",   "v_and_b32_e32",
+      "v_cmp_eq_u32_e32",   "v_cmp_gt_u32_e32",
+      "global_store_b32",
   };
   return std::find(names.begin(), names.end(), name) != names.end();
 }
@@ -41,6 +55,21 @@ bool admitted_instruction(std::string_view name) {
 Result reject(InputError &error, std::string message) {
   error = {.code = InputErrorCode::ResourceLimit, .text_offset = {}, .message = std::move(message)};
   return Result::failure();
+}
+
+uint32_t native_lds_width(std::string_view name, rj_code_arch_t arch) {
+  if (name == "ds_load_b32" || name == "ds_store_b32" || name == "ds_read_b32" ||
+      name == "ds_write_b32")
+    return 4;
+  if (arch != ROCJITSU_CODE_ARCH_CDNA5)
+    return 0;
+  if (name == "ds_load_u16" || name == "ds_load_i16" || name == "ds_store_b16")
+    return 2;
+  if (name == "ds_load_b64" || name == "ds_store_b64")
+    return 8;
+  if (name == "ds_load_b128" || name == "ds_store_b128")
+    return 16;
+  return 0;
 }
 
 } // namespace
@@ -54,11 +83,14 @@ Result qualify_lds_race_entry(const InputProgram &program, InputError &error) {
 }
 
 Result qualify_lds_race_block(const BasicBlock &block, InputError &error) {
-  // Static per-site reservations and occurrence ordering require acyclic flow.
+  // Defer the conditional self-loop to whole-program barrier qualification.
   for (const BasicBlock *successor : block.successors())
-    if (successor->start_offset() <= block.start_offset())
-      return reject_instruction(error, InputErrorCode::UnsupportedFlow,
-                                "MVP does not admit CFG backedges", block.start_offset());
+    if ((successor != &block && successor->start_offset() <= block.start_offset()) ||
+        (successor == &block && block.successors().size() != 2))
+      return reject_instruction(
+          error, InputErrorCode::UnsupportedFlow,
+          "only a conditional single-block backedge can enter barrier qualification",
+          block.start_offset());
   return Result::success();
 }
 
@@ -68,33 +100,34 @@ Result classify_lds_race_instruction(const Instruction &instruction, rj_code_arc
   const std::string_view name = instruction.mnemonic();
   const uint64_t offset = instruction.src_loc();
   if (arch == ROCJITSU_CODE_ARCH_CDNA5 && (name == "s_barrier_signal" || name == "s_barrier_wait"))
-    return Result::success();
+    return Result::success(); // The complete original group/CFG is qualified below.
   if ((instruction.flags() & BARRIER) != 0 || name.find("atomic") != std::string_view::npos ||
       name.starts_with("s_barrier") || name.starts_with("s_sendmsg"))
     return reject_instruction(error, InputErrorCode::UnsupportedSynchronization,
                               "unmodeled synchronization: " + std::string(name), offset);
-  if (name.starts_with("ds_") && name != "ds_load_b32" && name != "ds_store_b32" &&
-      name != "ds_read_b32" && name != "ds_write_b32")
+  const uint32_t width = native_lds_width(name, arch);
+  if (name.starts_with("ds_") && width == 0)
     return reject_instruction(error, InputErrorCode::UnsupportedAccess,
                               "unsupported LDS form: " + std::string(name), offset);
-  if (!admitted_instruction(name))
+  if (width == 0 && !admitted_instruction(name, arch))
     return reject_instruction(error, InputErrorCode::UnsupportedInstruction,
                               "instruction outside MVP: " + std::string(name), offset);
-  if (name == "ds_load_b32" || name == "ds_store_b32" || name == "ds_read_b32" ||
-      name == "ds_write_b32") {
+  if (width != 0) {
     // CDNA3/4 place GDS at bit 16; RDNA and CDNA5 use bit 17.
     const uint32_t gds_bit =
         (arch == ROCJITSU_CODE_ARCH_CDNA3 || arch == ROCJITSU_CODE_ARCH_CDNA4) ? 16 : 17;
     if (instruction.size() != 8 || (instruction.raw_encoding()[0] & (1u << gds_bit)) != 0)
       return reject_instruction(error, InputErrorCode::UnsupportedAccess, "non-native LDS form",
                                 offset);
-    const bool read = name == "ds_load_b32" || name == "ds_read_b32";
+    const bool read = name.starts_with("ds_load_") || name.starts_with("ds_read_");
     const Operand *address = instruction.src_operand(0);
     const Operand *value = read ? instruction.dst_operand(0) : instruction.src_operand(1);
     const std::optional<RegisterRef> address_reg = address->decoded_vgpr();
     const std::optional<RegisterRef> value_reg = value->decoded_vgpr();
-    if (!address_reg || !value_reg || address_reg->width != 1 || value_reg->width != 1 ||
-        address_reg->index >= allocated_vgprs || value_reg->index >= allocated_vgprs)
+    const uint32_t value_words = std::max(width / 4, 1u);
+    if (!address_reg || !value_reg || address_reg->width != 1 || value_reg->width != value_words ||
+        address_reg->index >= allocated_vgprs ||
+        uint32_t{value_reg->index} + value_words > allocated_vgprs)
       return reject_instruction(error, InputErrorCode::UnsupportedAccess,
                                 "LDS operands exceed allocation", offset);
     accesses.push_back(
@@ -102,7 +135,8 @@ Result classify_lds_race_instruction(const Instruction &instruction, rj_code_arc
          .original_offset = offset,
          .kind = read ? AccessKind::Read : AccessKind::Write,
          .address_vgpr = address_reg->index,
-         .immediate_bytes = static_cast<uint16_t>(instruction.raw_encoding()[0] & 0xffff)});
+         .immediate_bytes = static_cast<uint16_t>(instruction.raw_encoding()[0] & 0xffff),
+         .width = width});
   }
   return Result::success();
 }
@@ -156,6 +190,22 @@ Result qualify_lds_race_barrier(InputProgram &program, std::span<BasicBlock *con
                        .original_wait = instructions[wait_index]->src_loc()});
     }
   }
+  const BasicBlock *loop = nullptr;
+  for (const BasicBlock *block : blocks)
+    for (const BasicBlock *successor : block->successors())
+      if (successor == block) {
+        if (loop || block->successors().size() != 2 || program.target->id != 1250 ||
+            program.wave_size != 32 || members == 0)
+          return reject_instruction(error, InputErrorCode::UnsupportedFlow,
+                                    "requires one conditional single-block barrier loop");
+        loop = block;
+      }
+  if (loop) {
+    if (std::ranges::any_of(barrier_blocks, [&](const BasicBlock *block) { return block != loop; }))
+      return reject_instruction(error, InputErrorCode::UnsupportedFlow,
+                                "all repeated barrier groups must belong to the single loop block");
+    program.repeated = true;
+  }
   if (members == 0)
     return Result::success();
   if (members != 2 * program.barriers.size() || program.barriers.empty() ||
@@ -170,22 +220,23 @@ Result qualify_lds_race_barrier(InputProgram &program, std::span<BasicBlock *con
   if (entry == blocks.end())
     return reject_instruction(error, InputErrorCode::UnsupportedSynchronization,
                               "missing barrier entry");
-  for (const BasicBlock *barrier_block : barrier_blocks) {
-    std::vector<const BasicBlock *> pending{*entry};
-    std::set<const BasicBlock *> visited;
-    while (!pending.empty()) {
-      const BasicBlock *block = pending.back();
-      pending.pop_back();
-      if (block == barrier_block || !visited.insert(block).second)
-        continue;
-      if (block->successors().empty())
-        return reject_instruction(error, InputErrorCode::UnsupportedSynchronization,
-                                  "workgroup barrier does not converge on every exit",
-                                  block->start_offset());
-      for (const BasicBlock *successor : block->successors())
-        pending.push_back(successor);
+  if (!program.repeated)
+    for (const BasicBlock *barrier_block : barrier_blocks) {
+      std::vector<const BasicBlock *> pending{*entry};
+      std::set<const BasicBlock *> visited;
+      while (!pending.empty()) {
+        const BasicBlock *block = pending.back();
+        pending.pop_back();
+        if (block == barrier_block || !visited.insert(block).second)
+          continue;
+        if (block->successors().empty())
+          return reject_instruction(error, InputErrorCode::UnsupportedSynchronization,
+                                    "workgroup barrier does not converge on every exit",
+                                    block->start_offset());
+        for (const BasicBlock *successor : block->successors())
+          pending.push_back(successor);
+      }
     }
-  }
   std::ranges::sort(program.barriers, {}, &BarrierFacts::original_signal);
   return Result::success();
 }
@@ -209,8 +260,7 @@ Result validate_lds_race_accesses(const InputProgram &program, const PreparedArt
       const std::string_view name = instruction.mnemonic();
       if (name == "s_barrier_signal" || name == "s_barrier_wait")
         barrier_offsets.insert(instruction.src_loc());
-      if (name == "ds_load_b32" || name == "ds_store_b32" || name == "ds_read_b32" ||
-          name == "ds_write_b32")
+      if (native_lds_width(name, program.target->arch) != 0)
         access_offsets.insert(instruction.src_loc());
     }
   std::set<uint64_t> expected_barriers;

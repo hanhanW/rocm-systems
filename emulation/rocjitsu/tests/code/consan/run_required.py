@@ -55,10 +55,36 @@ def required_names():
         'ConSanHsaPlugin.RejectedAmdBarrierCannotOverwritePendingDispatchCompletion',
         'ConSanHsaPlugin.UntrackedBarriersAfterARejectionRetainTheirSignalsWithoutPublication',
         'ConSanHsaPlugin.MissingAmdSignalCreationKeepsCoreSignalSupportAvailable',
+        'ConSanSimProductionE2E.gfx1250.wave32.assembly.wide_u16',
+        'ConSanSimProductionE2E.gfx1250.wave32.assembly.wide_i16',
+        'ConSanSimProductionE2E.gfx1250.wave32.assembly.wide_b64',
+        'ConSanSimProductionE2E.gfx1250.wave32.assembly.wide_b128',
+        'ConSanSimProductionE2E.gfx1250.wave32.assembly.wide_u16_high',
+        'ConSanSimProductionE2E.gfx1250.wave32.assembly.wide_i16_high',
+        'ConSanSimProductionE2E.gfx1250.wave32.assembly.wide_b64_high',
+        'ConSanSimProductionE2E.gfx1250.wave32.assembly.wide_b128_high',
+        'ConSanSimProductionE2E.gfx1250.wave32.assembly.wide_alias',
+        'ConSanSimProductionE2E.gfx1250.wave32.assembly.wide_collision',
+        'ConSanSimProductionE2E.gfx1250.wave32.assembly.mixed_overlap',
+        'ConSanSimProductionE2E.gfx1250.wave32.assembly.mixed_b16',
+        'ConSanSimProductionE2E.gfx1250.wave32.assembly.mixed_disjoint',
+        'ConSanSimProductionE2E.gfx1250.wave32.assembly.mixed_read_read',
+        'ConSanSimProductionE2E.gfx1250.wave32.assembly.mixed_barrier',
         'ConSanSimProductionE2E.gfx1250.wave32.assembly.barrier',
         'ConSanSimProductionE2E.gfx1250.wave32.assembly.barrier_empty',
         'ConSanSimProductionE2E.gfx1250.wave32.assembly.barrier_high',
         'ConSanSimProductionE2E.gfx1250.wave32.assembly.barrier_separated',
+        'ConSanSimProductionE2E.gfx1250.wave32.assembly.barrier_multiple',
+        'ConSanSimProductionE2E.gfx1250.wave32.assembly.loop_zero',
+        'ConSanSimProductionE2E.gfx1250.wave32.assembly.loop_one',
+        'ConSanSimProductionE2E.gfx1250.wave32.assembly.loop_three',
+        'ConSanSimProductionE2E.gfx1250.wave32.assembly.loop_access_loss',
+        'ConSanSimProductionE2E.gfx1250.wave32.assembly.loop_sync_loss',
+        'ConSanSimProductionE2E.gfx1250.wave32.assembly.loop_no_b0',
+        'ConSanSimProductionE2E.gfx1250.wave32.assembly.loop_no_b0_full_journal',
+        'ConSanSimProductionE2E.gfx1250.wave32.assembly.loop_no_b0_sync_loss',
+        'ConSanSimProductionE2E.gfx1250.wave32.assembly.loop_no_b1',
+        'ConSanSimProductionE2E.gfx1250.wave32.assembly.loop_late',
         'ConSanSimProductionE2E.gfx1250.wave32.assembly.missing-statistics',
         'ConSanContract.TargetWaveFactsRoundTripAndRowsFollowActualGeometry',
         'ConSanAnalysis.Wave64HighLanesAndFullMasksRetainExactLanePairCounts',
@@ -84,6 +110,26 @@ def required_names():
         'ConSanHsaPlugin.RejectedNonDispatchPacketDoesNotModifyATrackedSignal',
         'ConSanHsaPlugin.IndividualBarriersStillPassThroughWithoutDispatchAdmission',
     }
+    for groups in (1, 4, 16):
+        for case in ('grouped_disjoint', 'grouped_barrier', 'grouped_empty'):
+            names.add(
+                f'ConSanSimProductionE2E.gfx1250.wave32.assembly.{case}.groups{groups}'
+            )
+    for groups in (4, 16):
+        for case in ('grouped_race', 'grouped_read_read', 'grouped_isolation'):
+            names.add(
+                f'ConSanSimProductionE2E.gfx1250.wave32.assembly.{case}.groups{groups}'
+            )
+    for case, groups in (
+        ('grouped_repeat', 4),
+        ('grouped_oversized', 17),
+        ('grouped_edge', 4),
+        ('grouped_missing_id', 4),
+    ):
+        names.add(f'ConSanSimE2E.gfx1250.wave32.assembly.{case}.groups{groups}')
+    names.add(
+        'ConSanSimProductionE2E.gfx1250.wave32.assembly.single_missing_id.groups1'
+    )
     for gpu, wave_size in MODES:
         suffix = f'{gpu}Wave{wave_size}'
         for case in RUNTIME_CASES:
@@ -195,7 +241,7 @@ def validate_physical_registrations(tests):
         test = available[name]
         if not name.startswith('ConSanPhysical'):
             raise ValueError(f'{name}: physical test has no simulator twin')
-        _, gpu, _, _, _ = name.split('.')
+        gpu = name.split('.')[1]
         properties = {
             item['name']: item['value'] for item in test.get('properties', [])
         }

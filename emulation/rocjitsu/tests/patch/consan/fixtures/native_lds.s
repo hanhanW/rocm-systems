@@ -103,6 +103,81 @@ CONSAN_KERNEL:
   v_mov_b32 v2, s4
   v_mov_b32 v5, 0
 
+#if CONSAN_CASE >= 25
+#if CONSAN_CASE == 25
+  s_mov_b32 s10, 0
+#elif CONSAN_CASE == 26
+  s_mov_b32 s10, 1
+#elif CONSAN_CASE == 28
+  s_mov_b32 s10, 6
+#elif CONSAN_CASE == 29 || CONSAN_CASE == 35
+  s_mov_b32 s10, 20
+#elif CONSAN_CASE == 34
+  s_mov_b32 s10, 16
+#elif CONSAN_CASE == 32
+  s_mov_b32 s10, 10
+#else
+  s_mov_b32 s10, 3
+#endif
+#if CONSAN_CASE == 32
+  s_mov_b32 s11, 576
+#else
+  s_mov_b32 s11, 0
+#endif
+  v_cmp_eq_u32 MASK_VCC, 0, v0
+  MASK_AND_SAVE MASK_SAVE, MASK_VCC
+  GLOBAL_STORE v5, v2, s[6:7]
+  MASK_MOVE MASK_EXEC, MASK_SAVE
+  s_cmp_eq_u32 s10, 0
+  s_cbranch_scc1 .Lloop_done
+#if CONSAN_CASE == 33
+  v_and_b32 v4, 31, v0
+  v_lshlrev_b32 v1, 2, v4
+#endif
+.Lloop:
+#if CONSAN_CASE == 33
+  v_cmp_gt_u32 MASK_VCC, 5, v0
+#else
+  v_cmp_eq_u32 MASK_VCC, s11, v0
+#endif
+  MASK_AND_SAVE MASK_SAVE, MASK_VCC
+  DS_STORE v1, v2
+  MASK_MOVE MASK_EXEC, MASK_SAVE
+#if CONSAN_CASE != 30 && CONSAN_CASE != 34 && CONSAN_CASE != 35
+  s_wait_dscnt 0
+  s_barrier_signal -1
+  s_barrier_wait -1
+#endif
+  s_add_u32 s12, s11, 32
+#if CONSAN_CASE == 33
+  // All waves read their own first five lanes after the full-workgroup barrier.
+  v_cmp_gt_u32 MASK_VCC, 5, v4
+#else
+  v_cmp_eq_u32 MASK_VCC, s12, v0
+#endif
+  MASK_AND_SAVE MASK_SAVE, MASK_VCC
+  DS_LOAD v3, v1
+  consan_wait_all
+  GLOBAL_STORE v5, v3, s[6:7]
+  MASK_MOVE MASK_EXEC, MASK_SAVE
+#if CONSAN_CASE != 31
+  s_wait_dscnt 0
+  s_barrier_signal -1
+  s_barrier_wait -1
+#endif
+#if CONSAN_CASE == 32
+  s_sub_u32 s11, s11, 64
+#else
+  s_add_u32 s11, s11, 1
+#endif
+  s_sub_u32 s10, s10, 1
+  s_cmp_eq_u32 s10, 0
+  s_cbranch_scc0 .Lloop
+.Lloop_done:
+  v_cmp_eq_u32 MASK_VCC, 0, v0
+  MASK_AND_SAVE MASK_SAVE, MASK_VCC
+  DS_STORE v1, v2 offset:4
+#else
 #if CONSAN_CASE == 10 || CONSAN_CASE == 11 || CONSAN_CASE == 12
   // Distinct addresses exercise grouping, bounded reservation and empty EXEC.
   v_lshlrev_b32 v1, 2, v0
@@ -226,6 +301,7 @@ CONSAN_KERNEL:
   consan_wait_all
   GLOBAL_STORE v5, v3, s[6:7]
 #endif
+#endif
   MASK_MOVE MASK_EXEC, MASK_SAVE
   consan_wait_all
   consan_wait_stores
@@ -243,7 +319,11 @@ CONSAN_KERNEL:
   // gfx1100 wave32 requires at least 16 user+system SGPR inputs. The
   // kernarg pointer stays at s[0:1]; padding moves workgroup X to s15.
   .amdhsa_user_sgpr_count 15
+#if defined(CONSAN_NO_WORKGROUP_ID) && CONSAN_NO_WORKGROUP_ID
+  .amdhsa_system_sgpr_workgroup_id_x 0
+#else
   .amdhsa_system_sgpr_workgroup_id_x 1
+#endif
   .amdhsa_system_vgpr_workitem_id 0
   .amdhsa_next_free_vgpr 8
   .amdhsa_next_free_sgpr 16

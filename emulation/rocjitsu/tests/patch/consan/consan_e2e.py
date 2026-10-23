@@ -57,15 +57,35 @@ class AnalysisDriver(Driver):
         assert not (self.directory / 'original.hsaco').exists()
         case = self.args.case
         pairs = (
-            1 if case in ('race', 'high_lane') else (2 if case == 'repeat_race' else 0)
+            self.args.workgroups
+            if case == 'grouped_race'
+            else (
+                1
+                if case in ('race', 'high_lane', 'mixed_overlap', 'mixed_b16')
+                else (2 if case == 'repeat_race' else 0)
+            )
         )
-        collisions = 1 if case == 'collision' else 0
+        collisions = (
+            (self.args.threads // 32)
+            if case == 'wide_collision'
+            else (1 if case == 'collision' else 0)
+        )
+        if case.startswith('loop_'):
+            pairs = 2 * {
+                'loop_no_b0': 3,
+                'loop_no_b1': 2,
+                'loop_no_b0_full_journal': 4,
+                'loop_no_b0_sync_loss': 4,
+            }.get(case, 0)
         status = 1 if pairs or collisions else 0
         # The dynamic loader's own trace records the analyzer's actual modules
         # without linking a runtime or adding a live-registry input to the tool.
         environment = self.environment | {'LD_DEBUG': 'files'}
-        first = self.run('analyze', [self.args.analyze, capture], status, environment)
-        replay = self.run('analyze-replay', [self.args.analyze, capture], status)
+        analysis_command = [self.args.analyze, capture]
+        if case.startswith('grouped_'):
+            analysis_command += ['--examples', 64]
+        first = self.run('analyze', analysis_command, status, environment)
+        replay = self.run('analyze-replay', analysis_command, status)
         assert first == replay, 'semantic replay changed'
         dependencies = (self.directory / 'analyze.stderr').read_text()
         for forbidden in (
@@ -82,7 +102,17 @@ class AnalysisDriver(Driver):
         assert result['entry'] == self.entry, (result['entry'], self.entry)
         assert result['cross_wave_pairs'] == pairs
         assert result['collision_groups'] == collisions
-        assert result['coverage_complete'] == (case != 'exhausted')
+        assert result['coverage_complete'] == (
+            case
+            not in (
+                'exhausted',
+                'loop_access_loss',
+                'loop_sync_loss',
+                'loop_late',
+                'loop_no_b0_full_journal',
+                'loop_no_b0_sync_loss',
+            )
+        )
         assert result['verdict'] == ('findings' if status else 'no_observed_findings')
         raw = json.loads((self.directory / 'inspect.stdout').read_text())
         assert result['execution_conditions'] == raw['execution_conditions'] == 15
@@ -93,10 +123,46 @@ class AnalysisDriver(Driver):
                 len(row['records']) for row in observed['rows']
             )
             assert analyzed['rejected_records'] == 0
-            assert analyzed['lost_occurrences'] == (1 if case == 'exhausted' else 0)
-            assert analyzed['ordering_uncertain'] == (case == 'exhausted')
+            assert analyzed['lost_occurrences'] == (
+                {
+                    'exhausted': 1,
+                    'loop_access_loss': 4,
+                    'loop_sync_loss': 32,
+                    'loop_no_b0_full_journal': 24,
+                    'loop_no_b0_sync_loss': 32,
+                }.get(case, 0)
+            )
+            assert analyzed['ordering_uncertain'] == (
+                case
+                in (
+                    'exhausted',
+                    'loop_access_loss',
+                    'loop_sync_loss',
+                    'loop_late',
+                    'loop_no_b0_full_journal',
+                    'loop_no_b0_sync_loss',
+                )
+            )
             assert analyzed['cross_wave_pairs'] == (
-                1 if case in ('race', 'repeat_race', 'high_lane') else 0
+                self.args.workgroups
+                if case == 'grouped_race'
+                else (
+                    1
+                    if case
+                    in (
+                        'race',
+                        'repeat_race',
+                        'high_lane',
+                        'mixed_overlap',
+                        'mixed_b16',
+                    )
+                    else {
+                        'loop_no_b0': 3,
+                        'loop_no_b1': 2,
+                        'loop_no_b0_full_journal': 4,
+                        'loop_no_b0_sync_loss': 4,
+                    }.get(case, 0)
+                )
             )
             assert analyzed['collision_groups'] == collisions
             if case in ('race', 'repeat_race', 'high_lane'):
@@ -115,6 +181,89 @@ class AnalysisDriver(Driver):
                 for participant in (finding['first'], finding['second']):
                     site = raw['sites'][participant['site']]
                     assert participant['original_offset'] == site['original_offset']
+            if case.startswith('grouped_'):
+                groups = self.args.workgroups
+                waves = (self.args.threads + 31) // 32
+                assert (
+                    analyzed['workgroup_count'] == groups
+                    and analyzed['waves_per_workgroup'] == waves
+                )
+                if case == 'grouped_race':
+                    examples = analyzed['cross_wave_examples']
+                    assert {
+                        finding['first']['workgroup_x'] for finding in examples
+                    } == set(range(groups))
+                    for finding in examples:
+                        assert (
+                            finding['first']['workgroup_x']
+                            == finding['second']['workgroup_x']
+                        )
+                        assert (
+                            finding['first']['wave'] == 0
+                            and finding['second']['wave'] == 1
+                        )
+                        assert finding['ordering'] == 'unordered'
+                if case in ('grouped_barrier', 'grouped_empty', 'grouped_repeat'):
+                    assert analyzed['ordered_pairs'] == groups * (waves - 1)
+                    assert (
+                        analyzed['required_barrier_waves']
+                        == analyzed['completed_barrier_waves']
+                        == groups * waves
+                    )
+                    examples = analyzed['ordered_examples']
+                    assert {
+                        finding['first']['workgroup_x'] for finding in examples
+                    } == set(range(groups))
+                    for finding in examples:
+                        assert (
+                            finding['first']['workgroup_x']
+                            == finding['second']['workgroup_x']
+                        )
+                        assert (
+                            finding['first']['wave'] == 0
+                            and finding['second']['wave'] > 0
+                        )
+                        assert finding['ordering'] == 'ordered'
+            if case.startswith('loop_'):
+                assert analyzed['integrity_events'] == 0
+                if case.startswith('loop_no_b0_'):
+                    # The same first four endpoints remain confirmed on either
+                    # side of the journal limit, despite later access/sync loss.
+                    examples = analyzed['cross_wave_examples']
+                    assert len(examples) == 4
+                    assert {finding['first']['phase'] for finding in examples} == set(
+                        range(4)
+                    )
+                    for finding in examples:
+                        assert finding['ordering'] == 'unordered'
+                        assert finding['first']['phase'] == finding['second']['phase']
+                        assert (
+                            finding['first']['sequence']
+                            == finding['second']['sequence']
+                            == finding['first']['phase'] + 1
+                        )
+                assert analyzed['ordering_unresolved_pairs'] == (
+                    1 if case == 'loop_late' else 0
+                )
+                assert analyzed['synchronization_loss'] == {
+                    'loop_sync_loss': 48,
+                    'loop_no_b0_sync_loss': 8,
+                    'loop_late': 8,
+                }.get(case, 0)
+            if case == 'mixed_barrier':
+                assert analyzed['ordered_pairs'] == 1
+                assert (
+                    analyzed['required_barrier_waves']
+                    == analyzed['completed_barrier_waves']
+                    == len(observed['rows'])
+                )
+                finding = analyzed['ordered_examples'][0]
+                assert finding['ordering'] == 'ordered'
+                assert (finding['first']['offset'], finding['first']['width']) == (0, 8)
+                assert (finding['second']['offset'], finding['second']['width']) == (
+                    4,
+                    4,
+                )
             if case.startswith('barrier'):
                 assert analyzed['ordered_pairs'] == (
                     2 if case == 'barrier_multiple' else 1
@@ -152,6 +301,7 @@ class AnalysisDriver(Driver):
             execution['cross_wave_examples'] = []
             execution['collision_examples'] = []
             execution['ordered_examples'] = []
+            execution['unresolved_examples'] = []
         assert (
             result == hidden
         ), 'example limit changed full semantic counts or coverage'

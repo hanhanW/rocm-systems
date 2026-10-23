@@ -32,7 +32,7 @@ TEST(ConSanDigest, OptionsIdentityNamesTheSoftwareAddressGroupReservation) {
       "address-groups-per-site=" + std::to_string(kAddressGroupsPerSite) + ";";
   EXPECT_NE(kMvpOptions.find(reservation), std::string_view::npos);
   EXPECT_EQ(hex(mvp_options_digest()),
-            "e60fe5ab32246cc8ea82200c7ffb626c68af9885b9fe931646140fd201c203c2");
+            "6eb953e43ff9dcd2f96685776fecf79459f478987c330547d6debdb6d3eb7e71");
 }
 
 TEST(ConSanDigest, KnownAnswersIncludePaddingAndMultipleBlocks) {
@@ -112,6 +112,128 @@ Manifest example() {
   return manifest;
 }
 
+TEST(ConSanBoundedLaunch, FourCompleteGroupsKeepAllPartialWaves) {
+  Manifest manifest = example();
+  manifest.target = 1250;
+  manifest.entry.workgroup_id_sgpr = 15;
+  ContractError error;
+  const FailureOr<LaunchLayout> layout =
+      plan_launch(manifest, {{260, 1, 1}, {65, 1, 1}}, 8, 0, &error);
+  ASSERT_TRUE(layout.succeeded()) << error.message;
+  EXPECT_EQ(layout.value().wave_count, 12u);
+  EXPECT_EQ(layout.value().report_bytes, 64u + 12u * 576u);
+}
+
+TEST(ConSanBoundedLaunch, ValidateAllRowsDimensionsIdentityAndBudgetsBeforeAllocation) {
+  Manifest manifest = example();
+  manifest.target = 1250;
+  manifest.entry.workgroup_id_sgpr = 15;
+  ContractError error;
+  for (const uint32_t groups : {1u, 4u, 16u}) {
+    const LaunchDimensions dimensions{{65 * groups, 1, 1}, {65, 1, 1}};
+    const FailureOr<LaunchLayout> layout = plan_launch(manifest, dimensions, 8, 0, &error);
+    ASSERT_TRUE(layout.succeeded()) << error.message;
+    EXPECT_EQ(layout.value().workgroup_count, groups);
+    EXPECT_EQ(layout.value().waves_per_workgroup, 3u);
+    EXPECT_EQ(layout.value().wave_count, 3 * groups);
+    const FailureOr<TransportImage> transport =
+        initialize_transport(manifest, dimensions, 8, 0, 1, 0x10000, &error);
+    ASSERT_TRUE(transport.succeeded()) << error.message;
+    for (uint32_t row = 0; row < 3 * groups; ++row) {
+      const size_t offset = kReportHeaderBytes + row * layout.value().row_stride;
+      EXPECT_EQ(wire::read_u32(transport.value().report, offset + wire::kRowWave), row % 3);
+      EXPECT_EQ(wire::read_u32(transport.value().report, offset + wire::kRowWorkgroupX), row / 3);
+      EXPECT_EQ(wire::read_u32(transport.value().report, offset + wire::kRowStatus), 0u);
+    }
+    ContractLimits limits;
+    limits.report_bytes = layout.value().report_bytes;
+    EXPECT_TRUE(plan_launch(manifest, dimensions, 8, 0, &error, limits).succeeded());
+    --limits.report_bytes;
+    EXPECT_TRUE(plan_launch(manifest, dimensions, 8, 0, &error, limits).failed());
+    EXPECT_EQ(error.code, ContractErrorCode::ResourceLimit);
+  }
+  for (const LaunchDimensions dimensions : {LaunchDimensions{{0, 1, 1}, {65, 1, 1}},
+                                            {{65, 1, 1}, {0, 1, 1}},
+                                            {{65 * 17, 1, 1}, {65, 1, 1}},
+                                            {{261, 1, 1}, {65, 1, 1}},
+                                            {{260, 2, 1}, {65, 1, 1}},
+                                            {{260, 1, 2}, {65, 1, 1}},
+                                            {{260, 1, 1}, {65, 2, 1}},
+                                            {{260, 1, 1}, {65, 1, 2}},
+                                            {{UINT32_MAX, 1, 1}, {65, 1, 1}},
+                                            {{UINT32_MAX, 1, 1}, {UINT32_MAX, 1, 1}},
+                                            {{1025, 1, 1}, {1025, 1, 1}}}) {
+    EXPECT_TRUE(plan_launch(manifest, dimensions, 8, 0, &error).failed());
+    EXPECT_EQ(error.code, ContractErrorCode::UnsupportedLaunch);
+  }
+  manifest.entry.workgroup_id_sgpr = UINT32_MAX;
+  EXPECT_TRUE(plan_launch(manifest, {{65, 1, 1}, {65, 1, 1}}, 8, 0).succeeded());
+  EXPECT_TRUE(plan_launch(manifest, {{260, 1, 1}, {65, 1, 1}}, 8, 0, &error).failed());
+  EXPECT_EQ(error.code, ContractErrorCode::UnsupportedLaunch);
+  manifest.entry.workgroup_id_sgpr = 15;
+  manifest.target = 1201;
+  EXPECT_TRUE(plan_launch(manifest, {{260, 1, 1}, {65, 1, 1}}, 8, 0, &error).failed());
+  EXPECT_EQ(error.code, ContractErrorCode::UnsupportedLaunch);
+}
+
+TEST(ConSanBoundedLaunch, DefaultReportCapNeverReducesQuotasOrSamplesWorkgroups) {
+  Manifest manifest = example();
+  manifest.target = 1250;
+  manifest.entry.workgroup_id_sgpr = 15;
+  manifest.original.bytes = 65536;
+  manifest.original_text_bytes = 16384;
+  manifest.entry.original_descriptor_offset = 32768;
+  manifest.prepared.bytes = 1048576;
+  manifest.prepared_text_bytes = 262144;
+  manifest.entry.prepared_descriptor_offset = 524288;
+  manifest.sites.clear();
+  for (uint32_t site = 0; site < 1024; ++site)
+    manifest.sites.push_back({.id = site,
+                              .analysis = AnalysisKind::LdsRaceDetection,
+                              .original_offset = uint64_t{site} * 8,
+                              .original_size = 8,
+                              .prepared_guest_offset = uint64_t{site} * 128,
+                              .prepared_guest_size = 8,
+                              .probe_offset = uint64_t{site} * 128 + 16,
+                              .probe_size = 64,
+                              .first_slot = site * kAddressGroupsPerSite});
+  ASSERT_TRUE(validate_manifest(manifest).succeeded());
+  ContractError error;
+  EXPECT_TRUE(plan_launch(manifest, {{16384, 1, 1}, {1024, 1, 1}}, 8, 0, &error).failed());
+  EXPECT_EQ(error.code, ContractErrorCode::ResourceLimit);
+  EXPECT_EQ(manifest.sites.size(), 1024u);
+  EXPECT_EQ(kAddressGroupsPerSite, 4u);
+}
+
+TEST(ConSanBoundedLaunch, ProbeRowOffsetsCannotWrapWhenSoftwareBudgetsAreRaised) {
+  Manifest manifest = example();
+  manifest.target = 1250;
+  manifest.entry.workgroup_id_sgpr = 15;
+  manifest.original.bytes = 2 * 1024 * 1024;
+  manifest.original_text_bytes = 1024 * 1024;
+  manifest.entry.original_descriptor_offset = 1024 * 1024;
+  manifest.prepared.bytes = 32 * 1024 * 1024;
+  manifest.prepared_text_bytes = 16 * 1024 * 1024;
+  manifest.entry.prepared_descriptor_offset = 24 * 1024 * 1024;
+  manifest.sites.clear();
+  for (uint32_t site = 0; site < 65536; ++site)
+    manifest.sites.push_back({.id = site,
+                              .analysis = AnalysisKind::LdsRaceDetection,
+                              .original_offset = uint64_t{site} * 8,
+                              .original_size = 8,
+                              .prepared_guest_offset = uint64_t{site} * 128,
+                              .prepared_guest_size = 8,
+                              .probe_offset = uint64_t{site} * 128 + 16,
+                              .probe_size = 64,
+                              .first_slot = site * kAddressGroupsPerSite});
+  ASSERT_TRUE(validate_manifest(manifest).succeeded());
+  ContractLimits limits;
+  limits.report_bytes = UINT64_MAX;
+  ContractError error;
+  EXPECT_TRUE(plan_launch(manifest, {{16384, 1, 1}, {1024, 1, 1}}, 8, 0, &error, limits).failed());
+  EXPECT_EQ(error.code, ContractErrorCode::ResourceLimit);
+}
+
 class ConSanContract : public ::testing::Test {
 protected:
   void SetUp() override {
@@ -141,7 +263,7 @@ protected:
     rehash();
   }
 
-  size_t count_offset() const { return kEntry + 76 + example().entry.name.size(); }
+  size_t count_offset() const { return kEntry + 80 + example().entry.name.size(); }
   size_t site_offset() const { return count_offset() + 4; }
 
   ContractError error_;
@@ -166,7 +288,7 @@ TEST_F(ConSanContract, OwningFactsRoundTripIsCanonicalAndLittleEndian) {
   const FailureOr<std::vector<uint8_t>> reencoded = encode_manifest(decoded.value());
   ASSERT_TRUE(reencoded.succeeded());
   EXPECT_EQ(reencoded.value(), bytes_);
-  EXPECT_EQ(bytes_.size(), 64u + 144u + 76u + original.entry.name.size() + 4u + 2u * 68u + 4u);
+  EXPECT_EQ(bytes_.size(), 64u + 144u + 80u + original.entry.name.size() + 4u + 2u * 68u + 4u);
   // gfx1100 is encoded as the integer 1100, after the two image identities
   // and the options digest. This also pins the independently specified layout.
   EXPECT_EQ(bytes_[64 + 112], 0x4c);
@@ -369,7 +491,9 @@ TEST_F(ConSanContract, TwoChecksShareOneStaticReservationPerAccessSite) {
                                           .report_bytes = 1216,
                                           .group_bytes = 8,
                                           .private_bytes = 0,
-                                          .wave_count = 2}));
+                                          .wave_count = 2,
+                                          .workgroup_count = 1,
+                                          .waves_per_workgroup = 2}));
   Manifest manifest = example();
   manifest.sites.pop_back();
   const FailureOr<LaunchLayout> single = plan_launch(manifest, kLaunch, 8, 0);

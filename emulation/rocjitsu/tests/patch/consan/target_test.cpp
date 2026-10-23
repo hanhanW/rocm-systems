@@ -4,6 +4,7 @@
 #include "target_fixture.h"
 
 #include "rocjitsu/code/amdgpu_code_object.h"
+#include "rocjitsu/code/basic_block.h"
 #include "rocjitsu/code/consan/encoding.h"
 #include "rocjitsu/code/consan/image/artifact.h"
 #include "rocjitsu/code/patch/consan/prepare.h"
@@ -78,6 +79,45 @@ TEST_P(ConSanTargetStatic, CallableArtifactsPreserveStaticSitesAndPrivateFrameAd
   }
 }
 
+TEST(ConSanNativeWidthsStatic, AdmitGfx1250B64WithExactWidths) {
+  const std::vector<uint8_t> original =
+      test::read_fixture(test::target_fixture_path({"gfx1250", 32}, "native-9"));
+  ASSERT_FALSE(original.empty());
+  InputError error;
+  const FailureOr<PreparedArtifact> artifact =
+      prepare(original, *target_profile("gfx1250"), "lds_producer_consumer", error);
+  ASSERT_TRUE(artifact.succeeded()) << error.message;
+  ASSERT_EQ(artifact.value().manifest.sites.size(), 2u);
+  EXPECT_EQ(artifact.value().manifest.sites[0].width, 8u);
+  EXPECT_EQ(artifact.value().manifest.sites[1].width, 4u);
+}
+
+TEST(ConSanNativeWidthsStatic, QualifyOnlyWholeRegisterSingleRangeForms) {
+  for (const auto &[name, width] : std::array<std::pair<const char *, uint32_t>, 5>{
+           {{"u16", 2}, {"i16", 2}, {"b64", 8}, {"b128", 16}, {"b128-alias", 16}}}) {
+    const std::vector<uint8_t> original = test::read_fixture(
+        test::target_fixture_path({"gfx1250", 32}, "width-" + std::string(name)));
+    ASSERT_FALSE(original.empty());
+    InputError error;
+    const FailureOr<PreparedArtifact> artifact =
+        prepare(original, *target_profile("gfx1250"), "lds_producer_consumer", error);
+    ASSERT_TRUE(artifact.succeeded()) << error.message;
+    ASSERT_EQ(artifact.value().manifest.sites.size(), 2u);
+    for (const SiteFacts &site : artifact.value().manifest.sites)
+      EXPECT_EQ(site.width, width);
+    EXPECT_TRUE(validate_prepared(original, artifact.value(), error).succeeded()) << error.message;
+  }
+  for (const char *name : {"excluded-b8", "excluded-b96", "excluded-partial"}) {
+    const std::vector<uint8_t> original = test::read_fixture(
+        test::target_fixture_path({"gfx1250", 32}, "width-" + std::string(name)));
+    ASSERT_FALSE(original.empty());
+    InputError error;
+    EXPECT_TRUE(
+        prepare(original, *target_profile("gfx1250"), "lds_producer_consumer", error).failed());
+    EXPECT_EQ(error.code, InputErrorCode::UnsupportedAccess) << error.message;
+  }
+}
+
 TEST(ConSanBarrierStatic, QualifiedGfx1250PairPreservesOriginalOperations) {
   for (const char *fixture : {"native-15", "native-16", "native-20", "native-21", "native-24"}) {
     SCOPED_TRACE(fixture);
@@ -135,6 +175,55 @@ TEST(ConSanBarrierStatic, RejectMismatchedMissingWaitAndNonconvergentGroups) {
     EXPECT_TRUE(
         prepare(original, *target_profile("gfx1250"), "lds_producer_consumer", error).failed());
     EXPECT_EQ(error.code, InputErrorCode::UnsupportedSynchronization) << error.message;
+  }
+}
+
+TEST(ConSanBarrierStatic, PreserveRealLoopBackedgesAndRejectMultipleBlockCycles) {
+  for (const char *name : {"native-25", "native-26", "native-27", "native-30", "native-31"}) {
+    SCOPED_TRACE(name);
+    auto original = test::read_fixture(test::target_fixture_path({"gfx1250", 32}, name));
+    InputError error;
+    const auto input =
+        build_input_program(original, *target_profile("gfx1250"), "lds_producer_consumer", error);
+    ASSERT_TRUE(input.succeeded()) << error.message;
+    ASSERT_TRUE(input.value().repeated);
+    const AmdGpuCodeObject object(original.data(), original.size());
+    const auto decoder = Decoder::create(ROCJITSU_CODE_ARCH_CDNA5);
+    ASSERT_TRUE(decoder);
+    const std::array entries{input.value().kernel.entry_text_offset};
+    const auto blocks =
+        BasicBlock::build_reachable(object, *decoder, ROCJITSU_CODE_ARCH_CDNA5, entries);
+    ASSERT_TRUE(blocks.succeeded());
+    const Instruction *backedge = nullptr;
+    for (const auto &block : blocks.value())
+      for (const Instruction &instruction : block->instructions()) {
+        const auto branch = instruction.branch_offset_bytes();
+        if (branch && *branch <= -static_cast<int64_t>(instruction.size())) {
+          ASSERT_EQ(backedge, nullptr);
+          backedge = &instruction;
+        }
+      }
+    ASSERT_NE(backedge, nullptr);
+    const auto artifact =
+        prepare(original, *target_profile("gfx1250"), "lds_producer_consumer", error);
+    ASSERT_TRUE(artifact.succeeded()) << error.message;
+    EXPECT_EQ(artifact.value().manifest.scope, ScopeKind::NativeLdsWorkgroupBarrierLoop);
+    EXPECT_TRUE(validate_prepared(original, artifact.value(), error).succeeded()) << error.message;
+    const AmdGpuCodeObject prepared(artifact.value().image.data(), artifact.value().image.size());
+    const auto &prepared_text = *prepared.text_sections().front();
+    EXPECT_EQ(
+        wire::read_u32(artifact.value().image, prepared_text.sectionOffset() + backedge->src_loc()),
+        backedge->raw_encoding()[0]);
+    // Redirect the real conditional backedge to the preheader. The resulting
+    // multi-block cycle is outside the currently admitted single-block shape.
+    const int64_t delta = (static_cast<int64_t>(input.value().kernel.entry_text_offset) -
+                           static_cast<int64_t>(backedge->src_loc()) - 4) /
+                          4;
+    wire::write_u32(original, input.value().text_file_offset + backedge->src_loc(),
+                    (backedge->raw_encoding()[0] & 0xffff0000u) | static_cast<uint16_t>(delta));
+    EXPECT_TRUE(
+        prepare(original, *target_profile("gfx1250"), "lds_producer_consumer", error).failed());
+    EXPECT_EQ(error.code, InputErrorCode::UnsupportedFlow) << error.message;
   }
 }
 
@@ -377,6 +466,30 @@ TEST_P(ConSanTargetStatic, HipWorkloadsMustContainQualifiedNativeLdsSites) {
         prepare(original, *target_profile(mode.target), "lds_producer_consumer", error);
     ASSERT_TRUE(prepared.succeeded()) << error.message;
     EXPECT_TRUE(validate_prepared(original, prepared.value(), error).succeeded()) << error.message;
+  }
+}
+
+TEST(ConSanBoundedStatic, BindOriginalWorkgroupInputAndRejectForgedIdentityFacts) {
+  for (const char *fixture : {"native-2", "native-no-workgroup-id"}) {
+    const std::vector<uint8_t> original =
+        test::read_fixture(test::target_fixture_path({"gfx1250", 32}, fixture));
+    ASSERT_FALSE(original.empty());
+    InputError error;
+    const FailureOr<PreparedArtifact> artifact =
+        prepare(original, *target_profile("gfx1250"), "lds_producer_consumer", error);
+    ASSERT_TRUE(artifact.succeeded()) << error.message;
+    const bool identity = std::string_view(fixture) == "native-2";
+    EXPECT_EQ(artifact.value().manifest.entry.workgroup_id_sgpr, identity ? 15u : UINT32_MAX);
+    ContractError contract_error;
+    EXPECT_EQ(plan_launch(artifact.value().manifest, {{260, 1, 1}, {65, 1, 1}}, 8, 0).succeeded(),
+              identity);
+    EXPECT_TRUE(plan_launch(artifact.value().manifest, {{65, 1, 1}, {65, 1, 1}}, 8, 0).succeeded());
+    Manifest forged = artifact.value().manifest;
+    forged.entry.workgroup_id_sgpr = identity ? 2 : 15;
+    ASSERT_TRUE(match_images(forged, original, artifact.value().image).succeeded());
+    EXPECT_TRUE(
+        verify_artifact_images(forged, original, artifact.value().image, &contract_error).failed());
+    EXPECT_EQ(contract_error.code, ContractErrorCode::IdentityMismatch);
   }
 }
 

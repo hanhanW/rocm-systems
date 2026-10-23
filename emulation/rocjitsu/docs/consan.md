@@ -152,13 +152,14 @@ original code-object files nor live HSA state.
 ## Available analysis
 
 `LdsRaceDetection` is the only implemented analysis. It checks ordinary native
-32-bit LDS reads/writes at naturally aligned addresses, using the same
-observations for two checks:
+LDS reads/writes at naturally aligned addresses, using the same observations
+for two checks. All supported targets retain b32; **gfx1250 wave32** also admits
+ordinary single-range b16, b64, and b128:
 
 | Check | What it reports |
 | --- | --- |
-| Cross-wave conflict | Address-group records from different waves access the same LDS word, with at least one write. Read/read pairs do not conflict. |
-| Same-instruction ordinary-store collision | Multiple lanes of one store observation write the same LDS word. |
+| Cross-wave conflict | Address-group records from different waves access overlapping half-open byte ranges, with at least one write. Read/read pairs do not conflict. |
+| Same-instruction ordinary-store collision | Multiple lanes of one store observation write the same LDS range. |
 
 ### Analysis and admission
 
@@ -172,14 +173,63 @@ The input code object must contain exactly one kernel, matching the requested
 entry. Selecting an entry does not exclude sibling kernels from this requirement;
 provide a code object containing only the selected kernel.
 
-The barrier profile requires at least two waves in one complete 1D workgroup
-and a closed forward CFG. The original `s_wait_dscnt 0` must immediately precede
-`s_barrier_signal -1`; the matching `s_barrier_wait -1` must be in the same
-basic block. Admitted arithmetic may separate signal and wait; memory operations
-may not. Each group block must dominate every exit. Repeated occurrences, dynamic IDs,
-partial/cluster barriers, loops, and paths bypassing the group are unsupported.
-These rules are established from original instructions; probe waits provide no
-guest synchronization evidence.
+The additional gfx1250 forms are `ds_store_b16`, `ds_load_u16`, `ds_load_i16`,
+`ds_store_b64`, `ds_load_b64`, `ds_store_b128`, and `ds_load_b128`. The b16 loads
+write a whole 32-bit result with unsigned or signed extension. Access probes
+capture addresses before an aliased load can overwrite them, record actual byte
+widths and byte immediates, and preserve every guest result word. b8/b96,
+partial-register subword loads, dual-range, transpose, FLAT, and atomic forms
+remain unsupported. The existing minimum fixed LDS extent remains four bytes.
+
+Range admission checks bounds by subtraction before calculating ends. Diagnosis
+sweeps checked ranges, retaining grouped counts for identical ranges, excluding
+Read/Read and same-wave pairs, and treating adjacent ranges as disjoint. Natural
+alignment and the admitted widths bound active range shapes. Widths share the
+same four-address-group quota, loss rules, exact collision masks, and qualified
+barrier certificates. The compatibility token/options reject older b32-only
+producer interpretations.
+
+gfx1250 wave32 accepts **1 through 16 complete 1D workgroups**. Grid/workgroup
+Y and Z must equal one, X must be nonzero, and grid X must be divisible by
+workgroup X. A 65-thread workgroup has a partial final wave: grid X=260 admits
+four such complete groups, while grid X=261 is an unsupported edge group.
+Sixteen is this experimental software profile's bound, not a hardware limit.
+Other target profiles retain one workgroup.
+
+Multiple groups require the original descriptor's workgroup-X SGPR input. Its
+location is saved in facts and verified against both images. Probes preserve
+that input and workitem IDs while addressing row
+`workgroup_x * waves_per_workgroup + local_wave`. Entries without that input
+remain functional for one group; multi-group launches reject before publication
+rather than enabling a new hardware ABI input or guessing an identity.
+
+The row header records the actual group X and local wave. Closed captures save
+the actual launch dimensions; diagnosis validates row identities and keys LDS
+by run, dispatch, and workgroup X, with Y=Z=0 in this profile. Equal offsets in
+different groups cannot form a candidate. Every barrier certificate requires
+all waves of its own group; a gap in another group does not revoke it. Results
+expose `workgroup_count`, `waves_per_workgroup`, and participant/issue
+`workgroup_x`; required/completed barrier-wave counts aggregate the group-local
+witnesses for execution coverage.
+
+Barrier profiles require at least two waves per workgroup. The original
+`s_wait_dscnt 0` must immediately precede `s_barrier_signal -1`; the matching
+`s_barrier_wait -1` must be in the same basic block. Admitted arithmetic may
+separate signal and wait; memory operations may not. At most sixteen static
+groups are admitted. In a closed acyclic direct CFG, each group block must
+dominate every exit. These checks use original instructions; probe waits cannot
+supply guest synchronization.
+
+The repeated profile admits one single-entry basic block with a conditional
+self-backedge and a forward exit, surrounded by otherwise acyclic direct flow.
+All barrier groups must belong to that block. A forward preheader may bypass
+the loop for zero iterations. Qualification does not require a general uniform
+trip-count analyzer: ordering requires each wave's actual journal evidence.
+Multi-block, nested and irreducible cycles, unconditional infinite loops,
+barriers outside the repeated block, and dynamic IDs/lifecycles are rejected.
+This is narrower than the prototype's cyclic qualification; support for its
+other valid loop forms remains parity work. gfx1201/gfx950 barrier qualification
+and execution remain separate work.
 
 Each unchanged guest completing wait advances a persistent per-wave phase. Access
 records retain the current phase separately from their dynamic access sequence.
@@ -201,6 +251,11 @@ collision uses the independently validated range and mask without relying on the
 endpoint's barrier position. Missing evidence differs from this contradiction:
 unrelated loss does not revoke a valid endpoint's complete witness. Only rows with
 consistent retained evidence contribute to the completed-barrier-wave count.
+Repeated sites retain their static position within the qualified barrier cycle:
+for example, a site between B0 and B1 in a two-barrier loop must have phase
+`2 * iteration + 1`. Numeric sequence agreement cannot legalize a different
+phase. This cycle-position check also permits residue zero for preheader,
+loop-edge and post-loop accesses, including a zero-iteration exit.
 
 The no-synchronization profile statically rules out synchronization. Two valid
 conflicting endpoints in the same workgroup therefore remain confirmed even if
@@ -210,6 +265,16 @@ invalid identity, status, or sequence are rejected; contradictory endpoint
 phases remain Incomplete.
 This independence does not apply to barrier profiles: every required participant
 must supply the witnesses needed to classify the pair, even without LDS accesses.
+
+In barrier profiles, unordered pairs require a closed synchronization interval
+for their own endpoints, not a loss-free journal for the entire dispatch.
+Matching completions at both adjacent boundaries, across every required wave,
+can establish that two accesses are in the same interval without an intervening
+supported barrier.
+Entry supplies the first lower boundary; a fully validated complete exit can
+supply the last upper boundary. A missing required boundary leaves the pair
+Incomplete. Unrelated later loss does not revoke a complete early interval or its
+confirmed finding; coverage remains incomplete and loss counters remain visible.
 
 The analyzer keeps `ordered_pairs`, confirmed `cross_wave_pairs`, and
 `ordering_unresolved_pairs` separate, with separate example arrays. Missing or
@@ -225,9 +290,45 @@ Barrier facts are saved with original/prepared signal/wait positions and the
 after-wait probe mapping. The producer compatibility token and options identity
 cover these meanings, and incompatible artifacts/captures reject explicitly.
 The journal reserves sixteen 32-byte records per wave separately from access
-reservations. Compiled HIP probes store sequence and phase in each report row.
-The shared callable DBI planner owns register preservation and allocation; sizing
-and descriptor checks apply before preparation.
+reservations. Completed records are immutable and publish payload before commit.
+After the journal fills, guest barriers continue and synchronization loss grows;
+final phase alone does not reconstruct missing witnesses. The qualified loop
+executes each static group once per cycle. Retained journal ordinal `phase - 1` selects its slot and derives occurrence as
+`(phase - 1) / static_groups + 1`. This calculation is bounded by the journal's
+sixteen slots; missing later occurrences are never reconstructed. Access sequence
+advances once per active guest instruction, shared by all its address-group facets; completing waits alone
+advance phase. Sequence, phase and loss counters saturate at
+`UINT32_MAX`, set a sticky exhaustion flag, and never wrap. Counter exhaustion
+cannot stop the guest or cause a store beyond its reservations.
+
+In repeated profiles, every dispatch/wave/static range owns four immutable
+first-publisher banks. An exact address group selects
+`ctz(guest_mask) % 4`; the first representative claims that bank, and later
+attempts leave its payload and identity unchanged. A new phase does not reclaim
+a bank. Different sites have separate committed slots and capacity. Probes still
+inspect at most four distinct addresses per instruction: remaining active lanes
+increment address-group exhaustion once. Thus four banks are neither four
+iterations nor a promise to retain every later address. Mapping collisions can
+lose a representative while other banks remain vacant.
+
+`lost_occurrences` is the legacy name for total access-loss events: occupied-bank
+representatives, address-group exhaustion, and suppressed operations after
+sequence exhaustion. `dropped_representatives` separates occupied-bank losses
+when counters remain exact; it is JSON null after counter exhaustion.
+`address_group_exhaustion`, `synchronization_loss`, and `counter_exhausted_waves`
+report the other limits. Saturated counters are lower bounds. Quota loss creates
+coverage issues but does not count as malformed-evidence `integrity_events`.
+Independent valid ordering witnesses and exact-mask collisions remain usable.
+
+The checked report size is `64 + workgroups * ceil(threads / wave_size) *
+(64 + sites * 4 * 64 + journal_bytes)`, with `journal_bytes=512` for barrier
+profiles and zero otherwise. Compiled HIP probes store counters and immutable
+committed slots in the owning report row. The shared callable DBI planner owns register preservation and allocation;
+entry snapshots preserve the local workitem and workgroup-X identity before
+any guest operation can overwrite them. Resource, branch-reach and report-cap
+checks reject before publishing an artifact; no quota is silently reduced.
+The runtime retains its existing nonoverlapping
+dispatch, one-queue/module, owning-snapshot and explicit-finish requirements.
 
 Recording is bounded and does not provide a full execution history. Broader
 access forms, synchronization forms, and application integration require
@@ -241,7 +342,7 @@ The AMDHSA code-object-v5 image, entry, target, and wave mode must match the
 simulator configuration. A runner option does not change an image's wave mode.
 
 The [controlled HSA runner](../tests/patch/consan/consan_hsa_runner.cpp) supplies this
-fixture's argument bindings, controlled queue, nonoverlapping one-workgroup
+fixture's argument bindings, controlled queue, nonoverlapping bounded 1D
 launch, and explicit finish protocol. It is the example application, not a
 general application launcher; other integrations must meet the runtime
 admission conditions linked above.

@@ -732,5 +732,59 @@ TEST_F(DbiRdna4EntryPrologueSim, DispatchAtTheOriginalEntrySkipsThePrologue) {
   expect_dispatch_at_the_original_entry_skips_the_prologue();
 }
 
+TEST(DbiEntrySnapshotSim, ScalarAndVectorInputsSurviveGuestOverwrites) {
+  for (const auto arch : {kCdna3, kCdna4, kRdna4}) {
+    SCOPED_TRACE(arch.sim_arch);
+    const util::FailureOr<uint32_t> guest_write = build_v_mov_b32_src(0, 135, arch.arch);
+    const util::FailureOr<uint32_t> guest_read = build_v_mov_b32_src(1, 256, arch.arch);
+    const util::FailureOr<uint32_t> scalar_output = build_v_mov_b32_src(2, 256, arch.arch);
+    const util::FailureOr<uint32_t> vector_output = build_v_mov_b32_src(3, 257, arch.arch);
+    ASSERT_TRUE(guest_write.succeeded());
+    ASSERT_TRUE(guest_read.succeeded());
+    ASSERT_TRUE(scalar_output.succeeded());
+    ASSERT_TRUE(vector_output.succeeded());
+    const std::vector<uint8_t> target = test::with_descriptor_metadata(
+        test::make_kernarg_kernel_elf({build_s_mov_b32(0, 128, arch.arch), guest_write.value(),
+                                       build_s_nop(0, arch.arch), guest_read.value(),
+                                       build_s_endpgm(arch.arch)},
+                                      64, arch.e_flags, kGuestKernargSize, arch.wave32),
+        arch.arch);
+    const auto body = test::make_amdgpu_probe_elf(
+        "entry_inputs",
+        {scalar_output.value(), vector_output.value(), build_s_setpc_b64(30, arch.arch)},
+        arch.e_flags);
+    const AmdGpuCodeObject object(target.data(), target.size());
+    const AmdGpuCodeObject probe(body.data(), body.size());
+    InstrumentationOptions options;
+    options.kernarg_binding = DbiKernargBinding::CallerSuppliedWrapper;
+    Instrumentor instrumentor(object, arch.arch, options);
+    InstrumentationPoint point;
+    point.anchor_offset = 8;
+    point.probe_obj = &probe;
+    point.probe_symbol = "entry_inputs";
+    point.probe_args = {{.source = ProbeArgSource::EntrySgpr, .register_index = 0},
+                        {.source = ProbeArgSource::EntryVgprLane0, .register_index = 0}};
+    instrumentor.add_point(point);
+    const auto result = instrumentor.patch_with_debug_summaries();
+    ASSERT_TRUE(result.errors.empty()) << result.errors.front();
+    const AmdGpuCodeObject patched(result.elf_bytes.data(), result.elf_bytes.size());
+    const auto entry = test::patched_entry_text_offset(patched);
+    ASSERT_TRUE(entry);
+    test::DbiSim sim;
+    ASSERT_NO_FATAL_FAILURE(sim.initialize(arch.sim_arch, arch.wave_size));
+    sim.set_kernarg(make_wrapper_image());
+    sim.set_entry_offset(*entry);
+    const auto values =
+        sim.run_and_read_vgprs(test::section_words(patched, ".text"),
+                               test::patched_private_segment_size(patched), {2, 3, 0});
+    ASSERT_EQ(values.size(), 3u);
+    for (uint32_t lane = 0; lane < arch.wave_size; ++lane) {
+      EXPECT_EQ(values[0][lane], static_cast<uint32_t>(kGuestKernargSentinel));
+      EXPECT_EQ(values[1][lane], 0u);
+      EXPECT_EQ(values[2][lane], 7u);
+    }
+  }
+}
+
 } // namespace
 } // namespace rocjitsu

@@ -27,10 +27,10 @@ TEST_P(ConSanCallableProbe, CompiledBodiesAreSelfContainedAndUseOnlyTheirArgumen
   ASSERT_FALSE(image.empty());
   AmdGpuCodeObject object(image.data(), image.size());
   ASSERT_TRUE(object.is_valid());
-  for (const auto &[name, arguments] : {std::pair{"rj_consan_entry", uint8_t{4}},
-                                        {"rj_consan_access", uint8_t{9}},
-                                        {"rj_consan_exit", uint8_t{4}},
-                                        {"rj_consan_barrier", uint8_t{6}}}) {
+  for (const auto &[name, arguments] : {std::pair{"rj_consan_entry", uint8_t{5}},
+                                        {"rj_consan_access", uint8_t{12}},
+                                        {"rj_consan_exit", uint8_t{5}},
+                                        {"rj_consan_barrier", uint8_t{8}}}) {
     SCOPED_TRACE(name);
     std::string error;
     const std::optional<ResolvedProbeSymbol> symbol = resolve_probe_symbol(object, name, &error);
@@ -41,7 +41,7 @@ TEST_P(ConSanCallableProbe, CompiledBodiesAreSelfContainedAndUseOnlyTheirArgumen
     const std::optional<RegisterSet> live = analyze_probe_live_ins(
         object, *symbol, body->arch, body->abi, &error, ProbeEntryState::ZeroVgprBanks);
     ASSERT_TRUE(live) << error;
-    EXPECT_TRUE(live->none());
+    EXPECT_TRUE(live->none()) << format_register_set(*live);
     const std::optional<ProbeClobberSummary> clobbers = build_probe_clobber_summary(*body, &error);
     ASSERT_TRUE(clobbers) << error;
     EXPECT_FALSE(clobbers->uses_private_segment);

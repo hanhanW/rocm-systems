@@ -99,7 +99,7 @@ current limits.
 - `probe_obj` + `probe_symbol` are **consumed**: set both to request a probe-call trampoline, or leave both empty for the inline nop. Setting only one is fatal.
 - `filter_flags` is still a reserved milestone guardrail; a non-default value is fatal until it gains a real consumer. `force_full_exec` is consumed (see [Mask policy](#mask-policy)); it is rejected only on an inline-nop site, which has no call envelope whose mask could be widened.
 - Probe calls require the probe body to read no register its ABI does not supply (`analyze_probe_live_ins`, see [Probe live-ins](#probe-live-ins)). Under `AmdGpuFuncReturnS30S31` that is the link pair plus the declared argument VGPRs; any other input is fatal.
-- Probe calls may pass 32-bit arguments via `InstrumentationPoint::probe_args`, delivered in VGPRs from `v0`. Each names a `ProbeArgSource`: a build-time constant, an anchor VGPR, a dword of the anchor `EXEC` mask, a dword of the framework's entry storage, or a lane-zero VGPR snapshot captured at dispatch entry. The count and the sources are declared by the caller and verified against the body; see [Probe arguments](#probe-arguments).
+- Probe calls may pass 32-bit arguments via `InstrumentationPoint::probe_args`, delivered in VGPRs from `v0`. Each names a `ProbeArgSource`: a build-time constant, an anchor VGPR, a dword of the anchor `EXEC` mask, a dword of the framework's entry storage, or an SGPR / lane-zero VGPR snapshot captured once at guest entry after wrapper restoration. The two snapshot slots share a bounded reservation; source class and index identify each value. Original allocation and enabled hardware-input bounds apply even when instrumentation grows the register file. The count and the sources are declared by the caller and verified against the body; see [Probe arguments](#probe-arguments).
 - Probe calls require the probe's link pair (`s[30:31]` for `rj_nop_probe`) to be within the kernel's SGPR allocation (`kernel_sgpr_count`) and any chosen scratch/special-state temps to be below `ordinary_sgpr_bound` of it; allocation growth requires explicit original metadata counts and a supported resource note (see [Probe-call register requirement](#instrumentation-flow-probe-call)).
 - Register spilling is enabled for `spill_set = live_at_anchor ∩ (probe_clobbers ∪ builder_clobbers)`. The orchestrator scans the kernel descriptor (`scan_kernel_descriptors`), builds one `SpillManager` from its `private_segment_fixed_size`, splits the spill set by class, and calls `plan_vgpr_spills` / `plan_sgpr_spills` / `plan_acc_spills`. Spilling is gated per-arch by `max_scratch_offset_bytes()` (returns 0 ⇒ arch has no scratch emitter ⇒ unsupported) and by those fail-closed helpers; there is no `SpillPolicy` enum. A kernel with zero scratch, more than one kernel, an over-offset-cap slot, a probe that clobbers FLAT_SCRATCH, or (for SGPR spills) no dead bridge VGPR within the kernel's VGPR allocation fails closed.
 
@@ -575,9 +575,13 @@ Without a binding, both patch entry points refuse entry-storage arguments. Tests
 that skip the gate without declaring a binding retain the original size and may
 hand the CP a wrapper directly. Skipping the gate does not allocate or initialize
 that wrapper.
-`EntryVgprLane0` can additionally capture up to two entry VGPR values into the
-prologue's temporary SGPR pair after kernarg restoration. Those slots then become
-persistent and are excluded from every call envelope, just like the pointer.
+`EntrySgpr` and `EntryVgprLane0` share up to two snapshot slots in the prologue's
+temporary SGPR pair after kernarg restoration. Each slot holds an original SGPR
+or lane-zero VGPR value. These slots then become persistent and are excluded
+from every call envelope, just like the pointer. The source must fit the original
+guest allocation or the descriptor's enabled scalar entry-input range, even when
+instrumentation grows the register file. This includes hardware input padding
+that the metadata's used-register count need not cover.
 
 `AnchorVgpr` sources are parallel copies made before constants or scalar-sourced
 argument writes. The builder orders overlapping copies and breaks cycles with a
@@ -587,8 +591,10 @@ probe clobbers, fixed argument/link registers, and persistent entry storage.
 
 `DeviceWaveState` provides explicit memory-backed sequence and loss counters for
 compiled probes. A client supplies counter locations in runtime-owned storage;
-the helper knows no ConSan row or record layout. It requires full EXEC and one
-wave's exclusive counter ownership. This is bounded capture bookkeeping, not the
+the helper knows no ConSan row or record layout. Counters saturate instead of
+wrapping and set a client-supplied sticky exhaustion word. The helper requires
+lane-zero participation and one wave's exclusive counter ownership; a callback
+may narrow EXEC to lane zero when publishing scalar completion state. This is bounded capture bookkeeping, not the
 future streaming transport or a per-record host acknowledgement protocol.
 
 `kernarg_segment_ptr_slot` and `CommandProcessor::init_wavefront_regs` walk the user-SGPR enable-bit order independently, and the CP interleaves register writes with its walk so it cannot call the helper. `tests/dbi/kernarg_sgpr_slot_test.cpp` dispatches every combination to pin the agreement; a drift would have the prologue load from an unrelated pair with no fault and every unit test still green.

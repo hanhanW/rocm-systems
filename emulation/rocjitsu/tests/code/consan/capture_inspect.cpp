@@ -35,7 +35,7 @@ int main(int argc, char **argv) {
       std::cout << ',';
     first = false;
     std::cout << "{\"id\":" << site.id << ",\"access\":" << uint32_t(site.access)
-              << ",\"original_offset\":" << site.original_offset
+              << ",\"width\":" << site.width << ",\"original_offset\":" << site.original_offset
               << ",\"guest_offset\":" << site.prepared_guest_offset << '}';
   }
   std::cout << "],\"executions\":[";
@@ -52,6 +52,8 @@ int main(int argc, char **argv) {
     std::cout << "{\"serial\":" << execution.serial << ",\"slot\":" << execution.storage_slot
               << ",\"generation\":" << execution.storage_generation << ",\"report_address\":"
               << *wire::read_u64(execution.context, wire::kContextReportPointer)
+              << ",\"grid_x\":" << execution.dimensions.grid[0]
+              << ",\"workgroup_size_x\":" << execution.dimensions.workgroup[0]
               << ",\"argument_u32\":";
     if (const std::optional<uint32_t> argument = wire::read_u32(execution.arguments, 0))
       std::cout << *argument;
@@ -63,11 +65,16 @@ int main(int argc, char **argv) {
         std::cout << ',';
       const size_t row = kReportHeaderBytes + wave * layout.value().row_stride;
       std::cout << "{\"wave\":" << *wire::read_u32(execution.report, row + wire::kRowWave)
+                << ",\"workgroup_x\":"
+                << *wire::read_u32(execution.report, row + wire::kRowWorkgroupX)
                 << ",\"serial\":" << *wire::read_u64(execution.report, row + wire::kRowSerial)
                 << ",\"status\":" << *wire::read_u32(execution.report, row + wire::kRowStatus)
                 << ",\"loss\":" << *wire::read_u32(execution.report, row + wire::kRowLoss)
                 << ",\"final_sequence\":"
                 << *wire::read_u32(execution.report, row + wire::kRowFinalSequence)
+                << ",\"sync_loss\":" << *wire::read_u32(execution.report, row + wire::kRowSyncLoss)
+                << ",\"counter_exhausted\":"
+                << *wire::read_u32(execution.report, row + wire::kRowCounterExhausted)
                 << ",\"final_phase\":"
                 << *wire::read_u32(execution.report, row + wire::kRowFinalPhase)
                 << ",\"completions\":[";
@@ -105,18 +112,18 @@ int main(int argc, char **argv) {
           if (!first_record)
             std::cout << ',';
           first_record = false;
-          std::cout << "{\"commit\":" << commit
-                    << ",\"site\":" << *wire::read_u32(execution.report, record + wire::kRecordSite)
-                    << ",\"sequence\":"
-                    << *wire::read_u32(execution.report, record + wire::kRecordSequence)
-                    << ",\"offset\":"
-                    << *wire::read_u32(execution.report, record + wire::kRecordLdsOffset)
-                    << ",\"width\":"
-                    << *wire::read_u32(execution.report, record + wire::kRecordWidth)
-                    << ",\"mask\":"
-                    << *wire::read_u64(execution.report, record + wire::kRecordGuestMask)
-                    << ",\"flags\":"
-                    << *wire::read_u32(execution.report, record + wire::kRecordFlags) << '}';
+          std::cout
+              << "{\"commit\":" << commit
+              << ",\"site\":" << *wire::read_u32(execution.report, record + wire::kRecordSite)
+              << ",\"sequence\":"
+              << *wire::read_u32(execution.report, record + wire::kRecordSequence)
+              << ",\"phase\":" << *wire::read_u32(execution.report, record + wire::kRecordPhase)
+              << ",\"offset\":"
+              << *wire::read_u32(execution.report, record + wire::kRecordLdsOffset)
+              << ",\"width\":" << *wire::read_u32(execution.report, record + wire::kRecordWidth)
+              << ",\"mask\":" << *wire::read_u64(execution.report, record + wire::kRecordGuestMask)
+              << ",\"flags\":" << *wire::read_u32(execution.report, record + wire::kRecordFlags)
+              << '}';
         }
       }
       std::cout << "]}";

@@ -140,6 +140,7 @@ target_link_libraries(
     consan_bootstrap_sim_test
     PRIVATE
         rocjitsu_consan_compiler
+        rocjitsu_consan_analysis
         ${RJ_OBJECT_LIBS}
         flatbuffers
         GTest::gtest_main
@@ -289,6 +290,11 @@ if(TARGET consan_hsa_runner)
         set(_name
             ConSan${environment}${_stage_name}${_variant_name}E2E.${gpu}.wave${wave_size}.${kind}.${scenario}
         )
+        set(_geometry_options)
+        if(ARGC GREATER 8)
+            list(APPEND _geometry_options --workgroups ${ARGV8})
+            string(APPEND _name ".groups${ARGV8}")
+        endif()
         set(_case ${scenario})
         set(_entry_options)
         set(_signal_options)
@@ -341,7 +347,7 @@ if(TARGET consan_hsa_runner)
                 ${RJ_CONSAN_TEST_ARTIFACT_ROOT} --case ${_case} --target ${gpu}
                 --wave-size ${wave_size} --threads ${threads} --fixture-kind
                 ${kind} ${_entry_options} ${_signal_options}
-                ${_execution_options}
+                ${_execution_options} ${_geometry_options}
         )
         set_tests_properties(${_name} PROPERTIES TIMEOUT 120)
         if(environment STREQUAL "Sim")
@@ -410,6 +416,60 @@ if(TARGET consan_hsa_runner)
             endforeach()
             if(RJ_BUILD_CONSAN_ANALYZER)
                 if(_gpu STREQUAL "gfx1250")
+                    foreach(_groups IN ITEMS 1 4 16)
+                        foreach(
+                            _scenario
+                            IN
+                            ITEMS grouped_disjoint grouped_barrier grouped_empty
+                        )
+                            consan_add_target_e2e(${_environment} ${_gpu} ${_wave_size} assembly
+                                ${_scenario} 65 production analysis ${_groups}
+                            )
+                        endforeach()
+                    endforeach()
+                    foreach(_groups IN ITEMS 4 16)
+                        foreach(
+                            _scenario
+                            IN
+                            ITEMS
+                                grouped_race
+                                grouped_read_read
+                                grouped_isolation
+                        )
+                            consan_add_target_e2e(${_environment} ${_gpu} ${_wave_size} assembly
+                                ${_scenario} 65 production analysis ${_groups}
+                            )
+                        endforeach()
+                    endforeach()
+                    consan_add_target_e2e(${_environment} ${_gpu} ${_wave_size} assembly grouped_repeat 65 testable analysis 4)
+                    consan_add_target_e2e(${_environment} ${_gpu} ${_wave_size} assembly grouped_oversized 65 testable analysis 17)
+                    consan_add_target_e2e(${_environment} ${_gpu} ${_wave_size} assembly grouped_edge 65 testable analysis 4)
+                    consan_add_target_e2e(${_environment} ${_gpu} ${_wave_size} assembly grouped_missing_id 65 testable analysis 4)
+                    consan_add_target_e2e(${_environment} ${_gpu} ${_wave_size} assembly single_missing_id 65 production analysis 1)
+                    foreach(
+                        _width_case
+                        IN
+                        ITEMS
+                            wide_u16
+                            wide_i16
+                            wide_b64
+                            wide_b128
+                            wide_u16_high
+                            wide_i16_high
+                            wide_b64_high
+                            wide_b128_high
+                            wide_alias
+                            wide_collision
+                            mixed_overlap
+                            mixed_b16
+                            mixed_disjoint
+                            mixed_read_read
+                            mixed_barrier
+                    )
+                        consan_add_target_e2e(${_environment} ${_gpu} ${_wave_size} assembly
+                            ${_width_case} 65 production analysis
+                        )
+                    endforeach()
                     foreach(
                         _barrier_case
                         IN
@@ -422,6 +482,25 @@ if(TARGET consan_hsa_runner)
                     )
                         consan_add_target_e2e(${_environment} ${_gpu} ${_wave_size} assembly
                             ${_barrier_case} 65 production analysis
+                        )
+                    endforeach()
+                    foreach(
+                        _loop_case
+                        IN
+                        ITEMS
+                            loop_zero
+                            loop_one
+                            loop_three
+                            loop_access_loss
+                            loop_sync_loss
+                            loop_no_b0
+                            loop_no_b0_full_journal
+                            loop_no_b0_sync_loss
+                            loop_no_b1
+                            loop_late
+                    )
+                        consan_add_target_e2e(${_environment} ${_gpu} ${_wave_size} assembly
+                            ${_loop_case} 64 production analysis
                         )
                     endforeach()
                 endif()
