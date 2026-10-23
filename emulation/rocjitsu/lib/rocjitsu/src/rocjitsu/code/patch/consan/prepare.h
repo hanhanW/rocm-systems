@@ -7,9 +7,12 @@
 
 namespace rocjitsu::consan {
 
+enum class ProbeBackend { Inline, Calls };
+
 struct PreparedArtifact {
   Manifest manifest;
   std::vector<uint8_t> image;
+  ProbeBackend backend = ProbeBackend::Inline;
 };
 
 /// @brief Check the shared prologue against ConSan's runtime wrapper offsets.
@@ -22,7 +25,8 @@ struct PreparedArtifact {
 /// @brief Prepare one exact original image without runtime allocations or handles.
 [[nodiscard]] FailureOr<PreparedArtifact> prepare(std::span<const uint8_t> original,
                                                   const TargetProfile &target,
-                                                  std::string_view entry, InputError &error);
+                                                  std::string_view entry, InputError &error,
+                                                  ProbeBackend backend = ProbeBackend::Inline);
 
 /// @brief Validate shared images/CFG/maps and analysis-specific preservation.
 /// @details Verify image identity, descriptor/note resources, branch boundaries,

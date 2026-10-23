@@ -4,6 +4,7 @@
 #pragma once
 
 #include "rocjitsu/code/consan/target.h"
+#include "rocjitsu/code/patch/consan/prepare.h"
 
 #include <filesystem>
 #include <fstream>
@@ -15,6 +16,7 @@ namespace rocjitsu::consan::test {
 struct TargetMode {
   const char *target;
   uint32_t wave_size;
+  ProbeBackend backend = ProbeBackend::Inline;
 };
 
 inline constexpr std::array kTargetModes = {
@@ -22,6 +24,13 @@ inline constexpr std::array kTargetModes = {
     TargetMode{"gfx1100", 64}, TargetMode{"gfx1201", 32}, TargetMode{"gfx1201", 64},
     TargetMode{"gfx1250", 32},
 };
+
+inline constexpr auto kCallableTargetModes = [] {
+  auto modes = kTargetModes;
+  for (auto &mode : modes)
+    mode.backend = ProbeBackend::Calls;
+  return modes;
+}();
 
 inline std::filesystem::path target_fixture_path(TargetMode mode, std::string_view fixture) {
 #ifdef CONSAN_FIXTURE_DIR

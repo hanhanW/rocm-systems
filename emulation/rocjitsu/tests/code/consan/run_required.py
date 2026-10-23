@@ -122,6 +122,31 @@ def required_names():
             names.add(
                 f'ConSanTargets/ConSanHipSim.CompiledHipRaceDisjointAndReadReadExecuteTheirNativeSites/{suffix}'
             )
+    names.update(
+        name.replace('ConSanSim', 'ConSanSimCalls', 1)
+        for name in list(names)
+        if name.startswith('ConSanSim')
+    )
+    for gpu, wave in MODES:
+        names.add(
+            'ConSanTargets/ConSanTargetStatic.'
+            f'CallableArtifactsPreserveStaticSitesAndPrivateFrameAdmission/{gpu}Wave{wave}'
+        )
+        names.add(
+            'ConSanProbeModes/ConSanCallableProbe.'
+            f'CompiledBodiesAreSelfContainedAndUseOnlyTheirArguments/{gpu}Wave{wave}'
+        )
+        for case in (
+            'AssemblyAliasPreservesAllGuestRegistersAndPublishesBothWaves',
+            'HighLaneMasksAndEmptyExecHaveRealPublicationEvidence',
+            'ThreeWavesAndPartialTailUseDistinctRows',
+        ):
+            names.add(f'ConSanCallTargets/ConSanTargetSim.{case}/{gpu}Wave{wave}')
+        if gpu != 'gfx1250':
+            names.add(
+                'ConSanCallTargets/ConSanHipSim.'
+                f'CompiledHipRaceDisjointAndReadReadExecuteTheirNativeSites/{gpu}Wave{wave}'
+            )
     return names
 
 
@@ -193,6 +218,15 @@ def validate_physical_registrations(tests):
         ):
             raise ValueError(f'{name}: invalid physical execution properties')
         command = test.get('command', [])
+        expected_backend = (
+            'calls' if name.startswith('ConSanPhysicalCalls') else 'inline'
+        )
+        if command.count('--probe-backend') != 1 or command[
+            command.index('--probe-backend') + 1 :
+        ][:1] != [expected_backend]:
+            raise ValueError(
+                f'{name}: command does not select its declared probe backend'
+            )
         if any(
             option in command
             for option in ('--launcher', '--config', '--require-agent')

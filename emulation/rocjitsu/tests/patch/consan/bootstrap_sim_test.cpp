@@ -103,7 +103,8 @@ protected:
     std::vector<uint8_t> image = original;
     if (mode == Bootstrap::Instrumented) {
       const FailureOr<PreparedArtifact> artifact =
-          prepare(original, *target_profile(target_mode.target), "lds_producer_consumer", error);
+          prepare(original, *target_profile(target_mode.target), "lds_producer_consumer", error,
+                  target_mode.backend);
       ASSERT_TRUE(artifact.succeeded()) << error.message;
       image = artifact.value().image;
       result.manifest = artifact.value().manifest;
@@ -617,8 +618,13 @@ const auto target_name = [](const auto &info) {
 };
 INSTANTIATE_TEST_SUITE_P(ConSanTargets, ConSanTargetSim, ::testing::ValuesIn(test::kTargetModes),
                          target_name);
+INSTANTIATE_TEST_SUITE_P(ConSanCallTargets, ConSanTargetSim,
+                         ::testing::ValuesIn(test::kCallableTargetModes), target_name);
 INSTANTIATE_TEST_SUITE_P(ConSanTargets, ConSanHipSim,
                          ::testing::ValuesIn(std::span(test::kTargetModes).first(6)), target_name);
+INSTANTIATE_TEST_SUITE_P(ConSanCallTargets, ConSanHipSim,
+                         ::testing::ValuesIn(std::span(test::kCallableTargetModes).first(6)),
+                         target_name);
 
 } // namespace
 } // namespace rocjitsu::consan

@@ -9,6 +9,7 @@
 #include "rocjitsu/code/patch/consan/prepare.h"
 #include "rocjitsu/isa/decoder.h"
 #include "rocjitsu/isa/instruction.h"
+#include "rocjitsu/isa/target_registry.h"
 
 #include <gtest/gtest.h>
 
@@ -20,6 +21,64 @@ namespace rocjitsu::consan {
 namespace {
 
 class ConSanTargetStatic : public ::testing::TestWithParam<test::TargetMode> {};
+
+TEST_P(ConSanTargetStatic, CallableArtifactsPreserveStaticSitesAndPrivateFrameAdmission) {
+  const auto mode = GetParam();
+  const TargetProfile &target = *target_profile(mode.target);
+  for (const std::string_view fixture :
+       {"race", "disjoint", "read_read", "collision", "single_lane", "alias", "immediate",
+        "four_ranges", "exhausted", "empty", "branched", "native-14"}) {
+    SCOPED_TRACE(fixture);
+    const auto original = test::read_fixture(test::target_fixture_path(mode, fixture));
+    ASSERT_FALSE(original.empty());
+    InputError error;
+    const auto baseline = prepare(original, target, "lds_producer_consumer", error);
+    ASSERT_TRUE(baseline.succeeded()) << error.message;
+    const auto called =
+        prepare(original, target, "lds_producer_consumer", error, ProbeBackend::Calls);
+    ASSERT_TRUE(called.succeeded()) << error.message;
+    EXPECT_EQ(called.value().manifest.options, baseline.value().manifest.options);
+    const auto &sites = called.value().manifest.sites;
+    ASSERT_EQ(sites.size(), baseline.value().manifest.sites.size());
+    for (size_t index = 0; index < sites.size(); ++index) {
+      const auto &before = baseline.value().manifest.sites[index];
+      EXPECT_EQ(sites[index].id, before.id);
+      EXPECT_EQ(sites[index].original_offset, before.original_offset);
+      EXPECT_EQ(sites[index].access, before.access);
+      EXPECT_EQ(sites[index].first_slot, before.first_slot);
+    }
+    AmdGpuCodeObject image(called.value().image.data(), called.value().image.size());
+    const auto *text = image.text_sections().front();
+    const auto kernels =
+        scan_kernel_descriptors(called.value().image, text->sectionOffset(), text->size());
+    ASSERT_EQ(kernels.size(), 1u);
+    std::vector<uint32_t> words(text->size() / sizeof(uint32_t));
+    std::memcpy(words.data(), text->data(), text->size());
+    auto decoder = target.public_id == ROCJITSU_CODE_TARGET_INVALID
+                       ? Decoder::create(target.arch)
+                       : Decoder::create(default_isa_target_registry(), target.public_id);
+    ASSERT_TRUE(decoder);
+    size_t calls = 0;
+    for (size_t cursor = 0; cursor < words.size();) {
+      auto instruction = decoder->decode_window(std::span(words).subspan(cursor), cursor * 4);
+      ASSERT_TRUE(instruction.succeeded());
+      calls += (instruction.value()->flags() & INDIRECT_CALL) != 0;
+      cursor += instruction.value()->size() / sizeof(uint32_t);
+    }
+    const auto input = build_input_program(original, target, "lds_producer_consumer", error);
+    ASSERT_TRUE(input.succeeded());
+    const size_t exits = std::ranges::count_if(
+        input.value().instructions, [](const auto &instruction) { return instruction.terminates; });
+    EXPECT_EQ(calls, sites.size() + exits + 1);
+    EXPECT_EQ(kernels.front().descriptor.private_segment_fixed_size, 0u);
+    EXPECT_EQ(kernels.front().descriptor.group_segment_fixed_size,
+              baseline.value().manifest.entry.original_group_bytes);
+    auto corrupted = called.value();
+    corrupted.image[text->sectionOffset() + sites.front().probe_offset] ^= 1;
+    corrupted.manifest.prepared.sha256 = digest(corrupted.image);
+    EXPECT_TRUE(validate_prepared(original, corrupted, error).failed());
+  }
+}
 
 TEST_P(ConSanTargetStatic, EquivalentMetadataEnvironmentsPreserveTargetAndAbiValidation) {
   const test::TargetMode mode = GetParam();

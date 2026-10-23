@@ -34,6 +34,8 @@ def paired_registrations():
             '137',
             '--case',
             'shared-fixture',
+            '--probe-backend',
+            'calls' if name.startswith('ConSanPhysicalCalls') else 'inline',
         ]
         tests.append(
             {
@@ -74,6 +76,16 @@ def set_property(test, name, value):
 
 
 class RequiredCoverage(unittest.TestCase):
+    def test_callable_registration_cannot_run_the_inline_backend(self):
+        tests = paired_registrations()
+        name = 'ConSanPhysicalCallsE2E.gfx1250.wave32.assembly.partial'
+        for test in tests:
+            if test['name'] in (name, name.replace('ConSanPhysical', 'ConSanSim', 1)):
+                index = test['command'].index('--probe-backend')
+                test['command'][index + 1] = 'inline'
+        with self.assertRaisesRegex(ValueError, 'declared probe backend'):
+            validate_physical_registrations(tests)
+
     def test_missing_physical_registration_fails(self):
         tests = paired_registrations()
         validate_physical_registrations(tests)

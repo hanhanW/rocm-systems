@@ -48,6 +48,7 @@ struct LdsRaceProbePlan {
                                                    InputError &error);
 [[nodiscard]] FailureOr<LdsRaceProbePlan> plan_lds_race_probes(const InputProgram &program,
                                                                InputError &error);
+[[nodiscard]] FailureOr<uint32_t> lds_race_row_stride(size_t sites, InputError &error);
 
 // The coordinator places the shared DBI context bootstrap once. These emit only
 // this analysis's row entry/access/exit observations and preserve guest state.

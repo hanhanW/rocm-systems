@@ -13,6 +13,36 @@ from consan_runtime_e2e import Driver, HardwareUnavailable
 
 
 class RuntimeIntegration(unittest.TestCase):
+    def test_callable_preparation_is_selected_and_must_be_acknowledged(self):
+        for backend in ('inline', 'calls'):
+            with self.subTest(
+                backend=backend
+            ), tempfile.TemporaryDirectory() as directory:
+                args = argparse.Namespace(
+                    root=Path(directory), case='disjoint', probe_backend='calls'
+                )
+                driver = Driver(args)
+                result = argparse.Namespace(
+                    returncode=0, stdout=f'backend={backend}', stderr=''
+                )
+                with mock.patch(
+                    'consan_runtime_e2e.subprocess.run', return_value=result
+                ) as run:
+                    if backend == 'inline':
+                        with self.assertRaisesRegex(AssertionError, 'callable probes'):
+                            driver.run(
+                                'prepare',
+                                ['prepare', 'original', 'target', 'entry', 'artifact'],
+                            )
+                    else:
+                        driver.run(
+                            'prepare',
+                            ['prepare', 'original', 'target', 'entry', 'artifact'],
+                        )
+                self.assertEqual(
+                    run.call_args.args[0][-2:], ['--probe-backend', 'calls']
+                )
+
     def test_missing_statistics_checks_the_requested_agent_first(self):
         with tempfile.TemporaryDirectory() as directory:
             build = Path(directory)

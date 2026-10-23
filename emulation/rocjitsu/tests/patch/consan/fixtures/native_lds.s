@@ -20,6 +20,9 @@
 #ifndef CONSAN_LEGACY
 #define CONSAN_LEGACY 0
 #endif
+#ifndef CONSAN_BENCHMARK_PAIRS
+#define CONSAN_BENCHMARK_PAIRS 1
+#endif
 #ifndef CONSAN_GFX12
 #define CONSAN_GFX12 0
 #endif
@@ -125,6 +128,9 @@ CONSAN_KERNEL:
   v_and_b32 v4, (CONSAN_WAVE_SIZE-1), v0
   v_cmp_eq_u32 MASK_VCC, 0, v4
   MASK_AND_SAVE MASK_SAVE, MASK_VCC
+  // Unroll defined accesses for the offline backend benchmark. Ordinary test
+  // fixtures retain one pair, and every expansion has its own static sites.
+  .rept CONSAN_BENCHMARK_PAIRS
   DS_STORE v1, v2
   consan_wait_all
 #if CONSAN_CASE == 6
@@ -136,6 +142,7 @@ CONSAN_KERNEL:
   consan_wait_all
   GLOBAL_STORE v5, v3, s[6:7]
 #endif
+  .endr
 #elif CONSAN_CASE == 4 || CONSAN_CASE == 5
 #if CONSAN_CASE == 4
   v_cmp_gt_u32 MASK_VCC, 2, v0

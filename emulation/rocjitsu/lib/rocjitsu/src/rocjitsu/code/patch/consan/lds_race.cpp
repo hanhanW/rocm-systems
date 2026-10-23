@@ -551,6 +551,16 @@ Result classify_lds_race_instruction(const Instruction &instruction, rj_code_arc
   return Result::success();
 }
 
+FailureOr<uint32_t> lds_race_row_stride(size_t sites, InputError &error) {
+  if (sites > ContractLimits{}.sites)
+    return reject(error, "no bounded LDS report-row layout");
+  const uint64_t stride =
+      kRowHeaderBytes + uint64_t{sites} * kAddressGroupsPerSite * kAccessRecordBytes;
+  if (stride > ContractLimits{}.report_bytes - kReportHeaderBytes)
+    return reject(error, "no bounded LDS report-row layout");
+  return static_cast<uint32_t>(stride);
+}
+
 FailureOr<LdsRaceProbePlan> plan_lds_race_probes(const InputProgram &program, InputError &error) {
   assert(program.target != nullptr && "qualified input requires a target");
   assert(
@@ -568,9 +578,10 @@ FailureOr<LdsRaceProbePlan> plan_lds_race_probes(const InputProgram &program, In
   // uniform payloads. Preserve the original declared registers and ABI inputs.
   const uint32_t sgprs = std::max(program.original_sgprs, scalar_base + 22);
   const uint32_t vgprs = (vector_base + 2 + granule - 1) / granule * granule;
-  const uint64_t stride = kRowHeaderBytes + uint64_t{program.accesses.size()} *
-                                                kAddressGroupsPerSite * kAccessRecordBytes;
-  if (sgprs > 102 || vgprs > 256 || stride > ContractLimits{}.report_bytes - kReportHeaderBytes)
+  const auto stride = lds_race_row_stride(program.accesses.size(), error);
+  if (stride.failed())
+    return Result::failure();
+  if (sgprs > 102 || vgprs > 256)
     return reject(error, "no bounded, disjoint probe register/report plan");
   return LdsRaceProbePlan{.arch = arch,
                           .wave_size = program.wave_size,
@@ -578,7 +589,7 @@ FailureOr<LdsRaceProbePlan> plan_lds_race_probes(const InputProgram &program, In
                           .vector_base = vector_base,
                           .sgprs = sgprs,
                           .vgprs = vgprs,
-                          .row_stride = static_cast<uint32_t>(stride)};
+                          .row_stride = stride.value()};
 }
 
 Result emit_lds_race_entry(std::vector<uint8_t> &text, const LdsRaceProbePlan &plan,

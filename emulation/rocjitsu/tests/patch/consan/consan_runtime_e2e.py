@@ -85,6 +85,8 @@ class Driver:
 
     def run(self, label, command, expected=0, environment=None):
         argv = [str(item) for item in command]
+        if label == 'prepare' and self.args.probe_backend == 'calls':
+            argv += ['--probe-backend', 'calls']
         if label in ('application', 'original-baseline'):
             argv += [
                 '--target',
@@ -126,6 +128,10 @@ class Driver:
         assert (
             result.returncode == expected
         ), f'{label}: expected exit {expected}, got {result.returncode}\n{result.stderr}'
+        if label == 'prepare' and self.args.probe_backend == 'calls':
+            assert (
+                'backend=calls' in result.stdout.split()
+            ), 'preparation did not use callable probes'
         return result.stdout
 
     def execute(self):
@@ -425,6 +431,9 @@ class Driver:
 
 
 def add_target_arguments(parser):
+    parser.add_argument(
+        '--probe-backend', choices=('inline', 'calls'), default='inline'
+    )
     parser.add_argument('--test-statistics', action='store_true')
     parser.add_argument('--amd-signals', action='store_true')
     parser.add_argument(

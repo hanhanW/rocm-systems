@@ -6,6 +6,7 @@ add_executable(
     input_test.cpp
     prepare_test.cpp
     invariants_test.cpp
+    callable_probe_test.cpp
 )
 target_link_libraries(
     consan_input_test
@@ -234,6 +235,20 @@ if(
         PRIVATE ${ROCM_PATH}/lib/libhsa-runtime64.so ${CMAKE_DL_LIBS}
     )
     rj_configure_target(consan_hsa_runner WARNINGS)
+    add_executable(consan_dbi_benchmark consan_dbi_benchmark.cpp)
+    target_include_directories(
+        consan_dbi_benchmark
+        SYSTEM
+        PRIVATE ${ROCM_PATH}/include
+    )
+    target_link_libraries(
+        consan_dbi_benchmark
+        PRIVATE
+            rocjitsu_consan_image
+            rocjitsu_kernarg_extension
+            ${ROCM_PATH}/lib/libhsa-runtime64.so
+    )
+    rj_configure_target(consan_dbi_benchmark PRIVATE_INCLUDES WARNINGS)
     add_test(
         NAME ConSanRuntimeIntegration.Guards
         COMMAND
@@ -256,6 +271,19 @@ if(TARGET consan_hsa_runner)
         variant
         stage
     )
+        if(ARGC EQUAL 8)
+            foreach(_backend IN ITEMS inline calls)
+                consan_add_target_e2e(${environment} ${gpu} ${wave} ${kind}
+                    ${scenario} ${threads} ${variant} ${stage} ${_backend}
+                )
+            endforeach()
+            return()
+        endif()
+        set(_backend ${ARGV8})
+        set(_backend_name)
+        if(_backend STREQUAL "calls")
+            set(_backend_name Calls)
+        endif()
         set(_plugin hsa_consan_testable)
         set(_statistics --test-statistics)
         set(_variant_name)
@@ -278,7 +306,7 @@ if(TARGET consan_hsa_runner)
             message(FATAL_ERROR "Unknown ConSan test stage: ${stage}")
         endif()
         set(_name
-            ConSan${environment}${_stage_name}${_variant_name}E2E.${gpu}.wave${wave}.${kind}.${scenario}
+            ConSan${environment}${_backend_name}${_stage_name}${_variant_name}E2E.${gpu}.wave${wave}.${kind}.${scenario}
         )
         set(_case ${scenario})
         set(_entry_options)
@@ -331,7 +359,8 @@ if(TARGET consan_hsa_runner)
                 --fixtures ${_fixture_dir} --source ${PROJECT_SOURCE_DIR} --root
                 ${RJ_CONSAN_TEST_ARTIFACT_ROOT} --case ${_case} --target ${gpu}
                 --wave-size ${wave} --threads ${threads} --fixture-kind ${kind}
-                ${_entry_options} ${_signal_options} ${_execution_options}
+                --probe-backend ${_backend} ${_entry_options} ${_signal_options}
+                ${_execution_options}
         )
         set_tests_properties(${_name} PROPERTIES TIMEOUT 120)
         if(environment STREQUAL "Sim")

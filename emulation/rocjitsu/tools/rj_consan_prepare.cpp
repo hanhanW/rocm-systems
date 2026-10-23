@@ -21,9 +21,20 @@ bool write(const std::filesystem::path &path, std::span<const uint8_t> bytes) {
 }
 
 int run(int argc, char **argv) {
-  if (argc != 5) {
-    std::cerr << "Usage: rj_consan_prepare ORIGINAL.hsaco TARGET ENTRY NEW-ARTIFACT-DIRECTORY\n";
+  if (argc != 5 && argc != 7) {
+    std::cerr << "Usage: rj_consan_prepare ORIGINAL.hsaco TARGET ENTRY NEW-ARTIFACT-DIRECTORY "
+                 "[--probe-backend inline|calls]\n";
     return 2;
+  }
+  auto backend = rocjitsu::consan::ProbeBackend::Inline;
+  if (argc == 7) {
+    if (std::string_view(argv[5]) != "--probe-backend" ||
+        (std::string_view(argv[6]) != "inline" && std::string_view(argv[6]) != "calls")) {
+      std::cerr << "Expected --probe-backend inline|calls\n";
+      return 2;
+    }
+    if (std::string_view(argv[6]) == "calls")
+      backend = rocjitsu::consan::ProbeBackend::Calls;
   }
   const rocjitsu::consan::TargetProfile *target = rocjitsu::consan::target_profile(argv[2]);
   if (target == nullptr) {
@@ -48,7 +59,7 @@ int run(int argc, char **argv) {
   }
   rocjitsu::consan::InputError error;
   const rocjitsu::FailureOr<rocjitsu::consan::PreparedArtifact> artifact =
-      rocjitsu::consan::prepare(original, *target, argv[3], error);
+      rocjitsu::consan::prepare(original, *target, argv[3], error, backend);
   if (artifact.failed()) {
     std::cerr << "Preparation rejected input: " << error.message << '\n';
     return 2;
@@ -78,7 +89,10 @@ int run(int argc, char **argv) {
   std::cout << "prepared_bytes=" << manifest.prepared.bytes << " sites=" << manifest.sites.size()
             << " entry_offset=" << manifest.entry.prepared_entry_offset
             << " sgprs=" << manifest.entry.prepared_sgprs
-            << " vgprs=" << manifest.entry.prepared_vgprs << '\n';
+            << " vgprs=" << manifest.entry.prepared_vgprs << " backend="
+            << (artifact.value().backend == rocjitsu::consan::ProbeBackend::Calls ? "calls"
+                                                                                  : "inline")
+            << '\n';
   for (const rocjitsu::consan::SiteFacts &site : manifest.sites)
     std::cout << "site=" << site.id << " original=" << site.original_offset
               << " guest=" << site.prepared_guest_offset << " probe=" << site.probe_offset
