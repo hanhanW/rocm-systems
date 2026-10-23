@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT
 
 #include "rocjitsu/code/patch/instrumentor.h"
+#include "rocjitsu/code/patch/checked_text_edits.h"
 
 #include "rocjitsu/code/amdgpu_code_object.h"
 #include "rocjitsu/code/analysis/def_use_chain.h"
@@ -1716,8 +1717,8 @@ InstrumentedCodeObjectDebug Instrumentor::patch_with_debug_summaries() {
   // followed by the local cave. replace_text() grows .text in place and fixes
   // up the surrounding ELF (section/segment sizes, moved symbols, descriptor
   // entries).
-  const auto text_span = patcher.text_bytes();
-  std::vector<uint8_t> new_text(text_span.begin(), text_span.end());
+  std::vector<CheckedTextEdit> anchor_edits;
+  anchor_edits.reserve(applied.size());
   for (const auto &a : applied) {
     if (a.site->kind == InstrumentationKind::KernelEntry) {
       const uint64_t branch_pc =
@@ -1729,9 +1730,27 @@ InstrumentedCodeObjectDebug Instrumentor::patch_with_debug_summaries() {
       }
       entry_patch->words.back() = build_s_branch(*target, arch_);
     } else {
-      std::memcpy(new_text.data() + a.site->anchor_offset, a.bytes.patched_anchor_bytes.data(),
-                  a.site->original_size);
+      anchor_edits.push_back({a.site->anchor_offset,
+                              a.site->original_bytes,
+                              {a.bytes.patched_anchor_bytes.begin(),
+                               a.bytes.patched_anchor_bytes.begin() + a.site->original_size}});
     }
+  }
+  // Entry-only callbacks patch the appended stub, leaving original text intact.
+  const std::span<const uint8_t> original_text = patcher.text_bytes();
+  std::vector<uint8_t> new_text(original_text.begin(), original_text.end());
+  if (!anchor_edits.empty()) {
+    TextEditError edit_error;
+    FailureOr<CheckedTextEditResult> checked =
+        apply_checked_text_edits(obj_, obj_.target_id(), anchor_edits, edit_error);
+    if (checked.failed()) {
+      result.errors.emplace_back("anchor edit transaction: " + edit_error.message);
+      return result;
+    }
+    const CheckedTextEditResult &candidate = checked.value();
+    const std::span<const uint8_t> text_span =
+        std::span(candidate.image).subspan(candidate.section.file_offset, candidate.section.size);
+    new_text.assign(text_span.begin(), text_span.end());
   }
   // Append in the laid-out order: probe bodies first (one per distinct probe),
   // then the padding and the entry stub, then the per-site trampolines.

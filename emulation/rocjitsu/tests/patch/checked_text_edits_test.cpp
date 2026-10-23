@@ -1,0 +1,298 @@
+// Copyright (c) 2026 Advanced Micro Devices, Inc.
+// SPDX-License-Identifier: MIT
+
+#include "../dbi_test_util.h"
+#include "rocjitsu/code/amdgpu_code_object.h"
+#include "rocjitsu/code/builders/instruction_builder.h"
+#include "rocjitsu/code/patch/checked_text_edits.h"
+#include "rocjitsu/code/patch/code_object_patcher.h"
+#include "rocjitsu/code/patch/instrumentor.h"
+
+#include <gtest/gtest.h>
+
+#include <cstring>
+#include <limits>
+
+namespace rocjitsu {
+namespace {
+constexpr rj_code_target_id_t kTarget = ROCJITSU_CODE_TARGET_GFX1200;
+constexpr rj_code_arch_t kArch = ROCJITSU_CODE_ARCH_RDNA4;
+std::vector<uint8_t> bytes(std::initializer_list<uint32_t> words) {
+  std::vector<uint8_t> result(words.size() * 4);
+  std::memcpy(result.data(), words.begin(), result.size());
+  return result;
+}
+std::vector<uint8_t> fixture() {
+  return test::make_gfx1200_kernel_elf({build_s_nop(1, kArch), build_s_nop(2, kArch), 0xbe8000ffu,
+                                        0x12345678u, build_s_nop(3, kArch), 0xee068002u,
+                                        0x00800000u, 0, build_s_endpgm(kArch)},
+                                       0);
+}
+std::vector<CheckedTextEdit> edits() {
+  const uint32_t nop = build_s_nop(0, kArch);
+  return {{0, bytes({build_s_nop(1, kArch)}), bytes({nop})},
+          {8, bytes({0xbe8000ffu, 0x12345678u}), bytes({nop, nop})},
+          {20, bytes({0xee068002u, 0x00800000u, 0}), bytes({nop, nop, nop})}};
+}
+
+TEST(CheckedTextEdits, ThreeNonadjacentCompleteExtentsPreserveAllOtherImageBytes) {
+  const std::vector<uint8_t> image = fixture();
+  const AmdGpuCodeObject object(image.data(), image.size());
+  const std::vector<CheckedTextEdit> requests = edits();
+  TextEditError error;
+  FailureOr<CheckedTextEditResult> result =
+      apply_checked_text_edits(object, kTarget, requests, error);
+  ASSERT_TRUE(result.succeeded()) << error.message;
+  std::vector<uint8_t> expected = image;
+  for (const CheckedTextEdit &edit : requests)
+    std::memcpy(expected.data() + 0x100 + edit.offset, edit.replacement.data(),
+                edit.replacement.size());
+  EXPECT_EQ(result.value().image, expected);
+  EXPECT_EQ(result.value().edits, requests);
+  ASSERT_EQ(result.value().mapping.size(), 1u);
+  EXPECT_EQ(result.value().mapping.front().source_offset, 0u);
+  EXPECT_EQ(result.value().mapping.front().candidate_offset, 0u);
+  EXPECT_EQ(result.value().mapping.front().size, 36u);
+  EXPECT_EQ(std::memcmp(object.image_data(), image.data(), image.size()), 0);
+  EXPECT_TRUE(
+      validate_checked_text_candidate(object, kTarget, requests, result.value().image, error)
+          .succeeded())
+      << error.message;
+}
+
+TEST(CheckedTextEdits, SectionOnlyTransformationDoesNotRequireLoadMapping) {
+  std::vector<uint8_t> image = fixture();
+  Elf64_Ehdr header{};
+  std::memcpy(&header, image.data(), sizeof(header));
+  header.e_phnum = 0;
+  std::memcpy(image.data(), &header, sizeof(header));
+  const AmdGpuCodeObject object(image.data(), image.size());
+  TextEditError error;
+  const auto requests = edits();
+  const auto result = apply_checked_text_edits(object, kTarget, requests, error);
+  ASSERT_TRUE(result.succeeded()) << error.message;
+  EXPECT_TRUE(
+      validate_checked_text_candidate(object, kTarget, requests, result.value().image, error)
+          .succeeded())
+      << error.message;
+}
+
+TEST(CheckedTextEdits, LateFailuresReturnNoCandidateAndLeaveSourceUnchanged) {
+  const std::vector<uint8_t> image = fixture();
+  const AmdGpuCodeObject object(image.data(), image.size());
+  for (int mode = 0; mode < 8; ++mode) {
+    SCOPED_TRACE(mode);
+    std::vector<CheckedTextEdit> requests = edits();
+    switch (mode) {
+    case 0:
+      requests.back().expected[0] ^= 1;
+      break;
+    case 1:
+      requests.back().offset = std::numeric_limits<uint64_t>::max() - 3;
+      break;
+    case 2:
+      requests.push_back(requests.front());
+      break;
+    case 3:
+      requests.back().replacement.clear();
+      break;
+    case 4:
+      requests.back().replacement.resize(8);
+      break;
+    case 5:
+      requests.back().offset = 24;
+      break;
+    case 6:
+      requests.back().replacement = bytes({0xffffffffu, 0xffffffffu, 0xffffffffu});
+      break;
+    case 7:
+      requests.back().offset = 21;
+      break;
+    }
+    TextEditError error;
+    EXPECT_TRUE(apply_checked_text_edits(object, kTarget, requests, error).failed());
+    EXPECT_NE(error.code, TextEditErrorCode::None);
+    EXPECT_EQ(std::memcmp(object.image_data(), image.data(), image.size()), 0);
+  }
+}
+
+TEST(CheckedTextEdits, RejectsInteriorLiteralAndPartialInstruction) {
+  const std::vector<uint8_t> image = fixture();
+  const AmdGpuCodeObject object(image.data(), image.size());
+  for (const CheckedTextEdit &edit :
+       std::vector<CheckedTextEdit>{{12, bytes({0x12345678u}), bytes({build_s_nop(0, kArch)})},
+                                    {8, bytes({0xbe8000ffu}), bytes({build_s_nop(0, kArch)})},
+                                    {20, bytes({0xee068002u, 0x00800000u}),
+                                     bytes({build_s_nop(0, kArch), build_s_nop(0, kArch)})}}) {
+    TextEditError error;
+    EXPECT_TRUE(apply_checked_text_edits(object, kTarget, std::span(&edit, 1), error).failed());
+    EXPECT_EQ(error.code, TextEditErrorCode::InvalidInstruction) << error.message;
+  }
+}
+
+TEST(CheckedTextEdits, RejectsTruncatedOriginalEightAndTwelveByteInstructions) {
+  for (const std::vector<uint32_t> &words :
+       std::vector<std::vector<uint32_t>>{{0xbe8000ffu}, {0xee068002u, 0x00800000u}}) {
+    const std::vector<uint8_t> image = test::make_gfx1200_kernel_elf(words, 0);
+    const AmdGpuCodeObject object(image.data(), image.size());
+    CheckedTextEdit edit{0, std::vector<uint8_t>(words.size() * 4),
+                         std::vector<uint8_t>(words.size() * 4)};
+    std::memcpy(edit.expected.data(), words.data(), edit.expected.size());
+    for (size_t offset = 0; offset < edit.replacement.size(); offset += 4) {
+      const uint32_t nop = build_s_nop(0, kArch);
+      std::memcpy(edit.replacement.data() + offset, &nop, 4);
+    }
+    TextEditError error;
+    EXPECT_TRUE(apply_checked_text_edits(object, kTarget, std::span(&edit, 1), error).failed());
+    EXPECT_EQ(error.code, TextEditErrorCode::InvalidInstruction) << error.message;
+  }
+}
+
+TEST(CheckedTextEdits, IndependentValidatorRejectsTextMetadataAndTargetCorruption) {
+  const std::vector<uint8_t> image = fixture();
+  const AmdGpuCodeObject object(image.data(), image.size());
+  const std::vector<CheckedTextEdit> requests = edits();
+  TextEditError error;
+  FailureOr<CheckedTextEditResult> result =
+      apply_checked_text_edits(object, kTarget, requests, error);
+  ASSERT_TRUE(result.succeeded()) << error.message;
+  for (const size_t offset : {size_t{0x104}, size_t{0x100}, size_t{48}, size_t{0x100 + 36}}) {
+    std::vector<uint8_t> candidate = result.value().image;
+    candidate[offset] ^= 1;
+    EXPECT_TRUE(
+        validate_checked_text_candidate(object, kTarget, requests, candidate, error).failed())
+        << offset;
+  }
+  EXPECT_TRUE(
+      apply_checked_text_edits(object, ROCJITSU_CODE_TARGET_GFX1250, requests, error).failed());
+  EXPECT_EQ(error.code, TextEditErrorCode::UnsupportedTarget);
+  EXPECT_TRUE(apply_checked_text_edits(object, kTarget, {}, error).failed());
+}
+
+TEST(CheckedTextEdits, ClauseAndTwelveByteTrampolinePoliciesStaySeparate) {
+  const std::vector<uint8_t> image = fixture();
+  const AmdGpuCodeObject object(image.data(), image.size());
+  Instrumentor instrumentor(object, kArch);
+  instrumentor.add_point_by_offset(20, InstrumentationKind::BeforeInst);
+  EXPECT_TRUE(instrumentor.patch().elf_bytes.empty());
+
+  // s_clause 0 followed by a complete global store. The transaction cannot
+  // silently change the clause's instruction count or memory operation kinds.
+  const std::vector<uint8_t> clause_image = test::make_gfx1200_kernel_elf(
+      {0xbf850000u, 0xee068002u, 0x00800000u, 0, build_s_endpgm(kArch)}, 0);
+  const AmdGpuCodeObject clause_object(clause_image.data(), clause_image.size());
+  CheckedTextEdit edit = edits().back();
+  edit.offset = 4;
+  TextEditError error;
+  EXPECT_TRUE(
+      apply_checked_text_edits(clause_object, kTarget, std::span(&edit, 1), error).failed());
+  EXPECT_EQ(error.code, TextEditErrorCode::Clause) << error.message;
+}
+
+TEST(CheckedTextEdits, RejectsRelocationWritesAndInteriorSymbolEndpoints) {
+  for (int mode = 0; mode < 4; ++mode) {
+    SCOPED_TRACE(mode);
+    std::vector<uint8_t> image = fixture();
+    const AmdGpuCodeObject original(image.data(), image.size());
+    const CodeObjectPatcher patcher(original);
+    const std::vector<Elf64_Shdr> sections = patcher.section_headers();
+    const Section &text = *original.text_sections().front();
+    Elf64_Ehdr header{};
+    std::memcpy(&header, image.data(), sizeof(header));
+    for (size_t index = 0; index < sections.size(); ++index) {
+      const Elf64_Shdr &section = sections[index];
+      if (section.sh_type != SHT_SYMTAB)
+        continue;
+      if (mode == 0) {
+        // Reuse the allocated descriptor storage for a relocation table.
+        Elf64_Shdr relocation = sections[2];
+        relocation.sh_type = SHT_RELA;
+        relocation.sh_info = *text.sectionHeaderIndex();
+        relocation.sh_link = index;
+        relocation.sh_entsize = sizeof(Elf64_Rela);
+        relocation.sh_size = sizeof(Elf64_Rela);
+        Elf64_Rela record{};
+        record.r_offset = text.vaddr() + 20;
+        record.r_info = R_AMDGPU_ABS64;
+        std::memcpy(image.data() + relocation.sh_offset, &record, sizeof(record));
+        std::memcpy(image.data() + header.e_shoff + 2 * sizeof(Elf64_Shdr), &relocation,
+                    sizeof(relocation));
+      } else {
+        Elf64_Sym symbol{};
+        std::memcpy(&symbol, image.data() + section.sh_offset + sizeof(symbol), sizeof(symbol));
+        symbol.st_shndx = *text.sectionHeaderIndex();
+        symbol.st_info = elf_symbol_info(kElfSymbolBindLocal, kElfSymbolTypeFunc);
+        symbol.st_value = text.vaddr() + (mode == 1 ? 12 : 8);
+        symbol.st_size = mode == 1 ? 0 : (mode == 2 ? 4 : 8);
+        std::memcpy(image.data() + section.sh_offset + sizeof(symbol), &symbol, sizeof(symbol));
+      }
+    }
+    const AmdGpuCodeObject object(image.data(), image.size());
+    ASSERT_TRUE(object.is_valid());
+    TextEditError error;
+    FailureOr<CheckedTextEditResult> result =
+        apply_checked_text_edits(object, kTarget, edits(), error);
+    if (mode == 3) {
+      EXPECT_TRUE(result.succeeded()) << error.message;
+    } else {
+      EXPECT_TRUE(result.failed());
+      EXPECT_EQ(error.code, TextEditErrorCode::UnsupportedReferences) << error.message;
+    }
+  }
+}
+
+TEST(CheckedTextEdits, RejectsAliasedSectionsAndAdditionalExecutableSections) {
+  for (const bool alias : {false, true}) {
+    std::vector<uint8_t> image = fixture();
+    const AmdGpuCodeObject original(image.data(), image.size());
+    const CodeObjectPatcher patcher(original);
+    Elf64_Shdr section = patcher.section_headers()[2];
+    if (alias) {
+      section.sh_offset = 0x100;
+      section.sh_size = 36;
+    } else {
+      section.sh_flags |= SHF_EXECINSTR;
+    }
+    Elf64_Ehdr header{};
+    std::memcpy(&header, image.data(), sizeof(header));
+    std::memcpy(image.data() + header.e_shoff + 2 * sizeof(Elf64_Shdr), &section, sizeof(section));
+    const AmdGpuCodeObject object(image.data(), image.size());
+    ASSERT_TRUE(object.is_valid());
+    TextEditError error;
+    EXPECT_TRUE(apply_checked_text_edits(object, kTarget, edits(), error).failed());
+    EXPECT_EQ(error.code, TextEditErrorCode::InvalidImage) << error.message;
+  }
+}
+
+TEST(CheckedTextEdits, StreamingScanDistinguishesGfx1250ZeroLiteralFromPadding) {
+  const std::vector<uint8_t> image =
+      test::make_amdgpu_kernel_elf({0xbe8000ffu, 0, 0, build_s_endpgm(ROCJITSU_CODE_ARCH_CDNA5)}, 0,
+                                   3, EF_AMDGPU_MACH_AMDGCN_GFX1250);
+  const AmdGpuCodeObject object(image.data(), image.size());
+  const uint32_t nop = build_s_nop(0, ROCJITSU_CODE_ARCH_CDNA5);
+  CheckedTextEdit edit{0, bytes({0xbe8000ffu, 0}), bytes({nop, nop})};
+  TextEditError error;
+  EXPECT_TRUE(
+      apply_checked_text_edits(object, ROCJITSU_CODE_TARGET_GFX1250, std::span(&edit, 1), error)
+          .succeeded())
+      << error.message;
+  edit = {8, bytes({0}), bytes({nop})};
+  EXPECT_TRUE(
+      apply_checked_text_edits(object, ROCJITSU_CODE_TARGET_GFX1250, std::span(&edit, 1), error)
+          .failed());
+  EXPECT_EQ(error.code, TextEditErrorCode::InvalidInstruction);
+}
+
+TEST(CheckedTextEdits, RejectsBranchReferenceIntoReplacedLiteral) {
+  const std::vector<uint8_t> image = test::make_gfx1200_kernel_elf(
+      {build_s_branch(1, kArch), 0xbe8000ffu, 0x12345678u, build_s_endpgm(kArch)}, 0);
+  const AmdGpuCodeObject object(image.data(), image.size());
+  const uint32_t nop = build_s_nop(0, kArch);
+  const CheckedTextEdit edit{4, bytes({0xbe8000ffu, 0x12345678u}), bytes({nop, nop})};
+  TextEditError error;
+  EXPECT_TRUE(apply_checked_text_edits(object, kTarget, std::span(&edit, 1), error).failed());
+  EXPECT_EQ(error.code, TextEditErrorCode::UnsupportedReferences) << error.message;
+}
+
+} // namespace
+} // namespace rocjitsu

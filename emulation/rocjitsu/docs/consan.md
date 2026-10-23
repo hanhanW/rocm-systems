@@ -374,3 +374,59 @@ matching physical hardware. Required simulator cases must execute without skips;
 physical cases skip when the requested HSA agent is unavailable. Runtime-stage
 scenarios remain available without building the analyzer. Keep simulator and
 physical-target evidence distinct.
+
+## Fault injection
+
+FI01 provides an independent host-side mutation library in
+[`code/patch/fault_injection/drop_barrier.h`](../lib/rocjitsu/src/rocjitsu/code/patch/fault_injection/drop_barrier.h).
+It does not require ConSan compiler, runtime or analyzer components. It uses
+shared checked text edits, also used for general DBI anchor splicing. FI01 has
+no CLI; durable selection and file publication belong to FI03.
+
+The current complete DropBarrier profile admits gfx1250 wave32, little-endian
+AMDHSA ET_DYN ELF64 code-object-v5 images with one kernel descriptor and one
+executable `.text`. The text and descriptor must have unambiguous file-backed
+PT_LOAD mappings; the loaded descriptor's relative entry must resolve to the
+analyzed entry. This is bounded image admission, not runtime qualification.
+
+Discovery requires an exact kernel name and closed direct CFG ownership. It
+recognizes complete same-block builtin signal/wait groups with matching
+immediate IDs -1/-2 (workgroup) or -3/-4 (cluster). Non-barrier instructions
+may separate the members. Select one group explicitly from the inventory:
+
+```cpp
+FaultMutationError error;
+auto inventory = discover_drop_barriers(image, ROCJITSU_CODE_TARGET_GFX1250,
+                                       exact_entry_name, error);
+if (inventory.failed())
+  return Result::failure(); // Report error.code and error.message to the caller.
+
+DropBarrierRequest request;
+request.identity = inventory.value().identity;
+request.group = selected_group; // Explicitly selected from inventory.value().groups.
+auto mutant = apply_drop_barrier(image, request, error);
+if (mutant.failed())
+  return Result::failure();
+// mutant.value().edit_result.image contains the validated device ELF.
+```
+
+The request binds the pristine image digest, target, section, entry/owner and
+complete ordered member identity. Apply rediscovers and matches those facts,
+then replaces both members with target NOPs as one logical mutation. Other
+instructions, guest waits and metadata bytes remain unchanged. The independent
+validator checks exact changes and a fresh mutant inventory; it is also exposed
+as `validate_drop_barrier_candidate()`. Detailed contracts and typed failures
+are documented in the internal headers.
+
+Partial or interleaved groups, dynamic operands, named barrier lifecycle,
+`signal_isfirst`, clauses, cross-block pairs, shared helpers/calls, indirect
+owners and firmware-preload entries are unsupported. A qualified static group
+may be inside a direct loop: its removal affects every executed occurrence.
+There is no selection of one dynamic occurrence or proof of convergence.
+
+Use the mutant as a new original image for a **fresh ConSan prepare** before
+execution/capture and analysis; pristine artifacts and capture bindings cannot
+be reused. Preparation may independently reject a profile the mutation library
+admits. Mutation success validates the transformation only. Execution and
+detector qualification remain unverified: removing a barrier does not establish
+that a race occurs, that a run observes it, or that ConSan detects it.
