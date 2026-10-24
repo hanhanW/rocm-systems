@@ -44,6 +44,8 @@ Result finish_manifest(const InputProgram &program, PreparedArtifact &artifact, 
   manifest.target = program.target->id;
   manifest.wave_size = program.wave_size;
   manifest.code_object_abi = 5;
+  manifest.scope = program.barriers.empty() ? ScopeKind::NativeLdsNoSynchronization
+                                            : ScopeKind::NativeLdsWorkgroupBarrier;
   manifest.original_text_bytes = program.text_bytes;
   manifest.prepared_text_bytes = section.size();
   manifest.entry = {.name = program.kernel.kernel_name,
@@ -65,7 +67,8 @@ Result finish_manifest(const InputProgram &program, PreparedArtifact &artifact, 
 }
 
 FailureOr<PreparedArtifact> lower(const InputProgram &program, InputError &error) {
-  const FailureOr<uint32_t> stride = lds_race_row_stride(program.accesses.size(), error);
+  const FailureOr<uint32_t> stride =
+      lds_race_row_stride(program.accesses.size(), error, !program.barriers.empty());
   if (stride.failed())
     return Result::failure();
   const std::span<const uint8_t> probe_image =
@@ -111,6 +114,13 @@ FailureOr<PreparedArtifact> lower(const InputProgram &program, InputError &error
     add(access.original_offset, InstrumentationKind::BeforeInst, "rj_consan_access",
         std::move(args));
   }
+  for (uint32_t group = 0; group < program.barriers.size(); ++group) {
+    std::vector<ProbeArgValue> args = context_args;
+    args.push_back(probe_arg_imm(group));
+    args.push_back(probe_arg_imm(static_cast<uint32_t>(sync_offset(program.accesses.size()))));
+    add(program.barriers[group].original_wait, InstrumentationKind::AfterInst, "rj_consan_barrier",
+        std::move(args));
+  }
   for (const uint64_t offset : program.exit_offsets)
     add(offset, InstrumentationKind::KernelExit, "rj_consan_exit", context_args);
   InstrumentedCodeObject output = instrumentor.patch();
@@ -136,6 +146,21 @@ FailureOr<PreparedArtifact> lower(const InputProgram &program, InputError &error
                                        .probe_offset = mapping->instrumentation_offset,
                                        .probe_size = mapping->instrumentation_size,
                                        .first_slot = access.site * kAddressGroupsPerSite});
+  }
+  for (const BarrierFacts &barrier : program.barriers) {
+    const std::vector<InstrumentedSite>::iterator mapping =
+        std::ranges::find_if(output.sites, [&](const auto &site) {
+          return site.kind == InstrumentationKind::AfterInst &&
+                 site.original_offset == barrier.original_wait;
+        });
+    if (mapping == output.sites.end() || mapping->guest_size != 4)
+      return reject(error, "callable DBI lowering omitted a barrier completion mapping");
+    BarrierFacts facts = barrier;
+    facts.prepared_signal = barrier.original_signal;
+    facts.prepared_wait = mapping->guest_offset;
+    facts.completion_probe = mapping->instrumentation_offset;
+    facts.probe_size = mapping->instrumentation_size;
+    artifact.manifest.barriers.push_back(facts);
   }
   if (finish_manifest(program, artifact, output.resources.sgprs, output.resources.vgprs, error)
           .failed())

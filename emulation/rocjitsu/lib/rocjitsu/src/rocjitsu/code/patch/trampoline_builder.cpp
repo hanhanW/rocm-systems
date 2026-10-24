@@ -891,8 +891,9 @@ std::optional<TrampolineBytes> TrampolineBuilder::emit_probe_call(const Trampoli
   // before either scalar add reads it, independently of boundary waits.
   if (plan.arch == ROCJITSU_CODE_ARCH_RDNA4)
     env.push_back(build_sopp_encoding(plan.arch, rdna4::kSWaitAluSopp, 0xfffe));
-  const uint64_t va_after_getpc =
-      plan.trampoline_offset + static_cast<uint64_t>(getpc_index + 1) * sizeof(uint32_t);
+  const uint64_t va_after_getpc = plan.trampoline_offset +
+                                  (plan.probe_after_original ? plan.original_size : 0) +
+                                  static_cast<uint64_t>(getpc_index + 1) * sizeof(uint32_t);
   const uint64_t delta = static_cast<uint64_t>(static_cast<int64_t>(plan.probe_target_offset) -
                                                static_cast<int64_t>(va_after_getpc));
   env.push_back(build_s_add_u32(target_lo, target_lo, kLiteralConstant, plan.arch));
@@ -991,8 +992,10 @@ std::optional<TrampolineBytes> TrampolineBuilder::emit_probe_call(const Trampoli
   // Hand the synthesized envelope to build() for layout and branch math so the
   // SOPP range checks are shared with the inline path.
   TrampolinePlan emit_plan = plan;
-  emit_plan.before_items.assign(1, InlineAsmItem{std::move(env)});
+  emit_plan.before_items.clear();
   emit_plan.after_items.clear();
+  auto &items = plan.probe_after_original ? emit_plan.after_items : emit_plan.before_items;
+  items.push_back(InlineAsmItem{std::move(env)});
   return build(emit_plan, error_out);
 }
 
