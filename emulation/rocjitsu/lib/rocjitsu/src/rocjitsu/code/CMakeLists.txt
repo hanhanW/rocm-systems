@@ -51,6 +51,7 @@ rj_add_object_library(rocjitsu_analysis
     analysis/free_registers.cpp
     analysis/gfx1250_vgpr_msb.cpp
     analysis/indirect_branch_discovery.cpp
+    analysis/instruction_boundaries.cpp
     analysis/liveness.cpp
     analysis/static_barriers.cpp
 )

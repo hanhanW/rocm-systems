@@ -6,6 +6,8 @@
 #include "rocjitsu/code/builders/instruction_builder.h"
 #include "rocjitsu/code/patch/code_object_patcher.h"
 #include "rocjitsu/code/patch/fault_injection/drop_barrier.h"
+#include "rocjitsu/isa/decoder.h"
+#include "rocjitsu/isa/instruction.h"
 #include "rocjitsu/isa/target_registry.h"
 
 #include <gtest/gtest.h>
@@ -15,6 +17,7 @@
 #include <cstring>
 #include <fstream>
 #include <iterator>
+#include <limits>
 #include <memory>
 #include <optional>
 
@@ -37,7 +40,58 @@ std::vector<uint8_t> fixture(std::vector<uint32_t> words = {kGuestWait, kSignal,
   return image;
 }
 DropBarrierSelection selection_from(const FaultBarrierInventory &inventory, size_t pair = 0) {
-  return inventory.select(inventory.barriers.at(pair));
+  FaultMutationError error;
+  auto selected = select_drop_barrier(inventory, {.exact = std::nullopt, .ordinal = pair}, error);
+  EXPECT_TRUE(selected.succeeded()) << error.message;
+  return selected.succeeded() ? selected.value() : DropBarrierSelection{};
+}
+
+// Recipe oracle lives only in tests. It never calls apply or a production output checker.
+Result matches_drop_output(const FaultMutationContext &context,
+                           const DropBarrierSelection &selection,
+                           std::span<const uint8_t> candidate, FaultMutationError &error) {
+  if (!selection.belongs_to(context)) {
+    error = {FaultMutationErrorCode::BadIdentity, 0, "test oracle: wrong source"};
+    return Result::failure();
+  }
+  auto pristine = discover_drop_barriers(context, selection.owner.entry, error);
+  if (pristine.failed())
+    return Result::failure();
+  auto mismatch = [&] {
+    error = {FaultMutationErrorCode::ValidationFailure, 0, "test oracle: incorrect complete Drop"};
+    return Result::failure();
+  };
+  const auto barriers = pristine.value().barriers();
+  const auto selected = std::ranges::find(barriers, selection.barrier);
+  if (selected == barriers.end() || candidate.size() != context.image().size())
+    return mismatch();
+  std::vector<uint8_t> expected(context.image().begin(), context.image().end());
+  auto decoder = Decoder::create(default_isa_target_registry(), context.source().target_id());
+  for (const auto &member : selected->members) {
+    const size_t begin = pristine.value().section().file_offset + member.offset;
+    if (member.bytes.size() != 4 || begin + 4 > candidate.size())
+      return mismatch();
+    uint32_t word = 0;
+    std::memcpy(&word, candidate.data() + begin, 4);
+    auto instruction = decoder->decode_window(std::span(&word, 1), member.offset);
+    if (instruction.failed() || instruction.value()->size() != 4 ||
+        instruction.value()->mnemonic() != "s_nop" ||
+        instruction.value()->num_src_operands() != 1 ||
+        instruction.value()->src_operand(0)->encoding_value() != 0)
+      return mismatch();
+    std::memcpy(expected.data() + begin, &word, 4);
+  }
+  if (!std::ranges::equal(expected, candidate))
+    return mismatch();
+  const FaultMutationContext mutant(candidate);
+  auto remaining = discover_drop_barriers(mutant, selection.owner.entry, error);
+  if (remaining.failed())
+    return mismatch();
+  std::vector<StaticBarrier> wanted(barriers.begin(), barriers.end());
+  std::erase(wanted, *selected);
+  if (!std::ranges::equal(remaining.value().barriers(), wanted))
+    return mismatch();
+  return Result::success();
 }
 
 std::vector<uint8_t>
@@ -129,6 +183,104 @@ std::vector<uint8_t> row_fixture(const DropTargetRow &row, std::vector<uint32_t>
 
 class FaultDropBarrierFamily : public ::testing::TestWithParam<DropTargetRow> {};
 
+TEST_P(FaultDropBarrierFamily, SelectorUsesLogicalOrderExactPrecedenceAndImmutableRecords) {
+  const auto &row = GetParam();
+  const FaultMutationContext context(row_fixture(row, row_words(row)));
+  FaultMutationError error;
+  const auto inventory = discover_drop_barriers(context, "test_kernel", error);
+  ASSERT_TRUE(inventory.succeeded()) << error.message;
+  const auto again = discover_drop_barriers(context, "test_kernel", error);
+  ASSERT_TRUE(again.succeeded());
+  EXPECT_EQ(inventory.value().barriers().data(), again.value().barriers().data());
+  ASSERT_EQ(inventory.value().barriers().size(), 2u);
+  auto first = select_drop_barrier(inventory.value(), {}, error);
+  auto second =
+      select_drop_barrier(inventory.value(), {.exact = std::nullopt, .ordinal = 1}, error);
+  ASSERT_TRUE(first.succeeded());
+  ASSERT_TRUE(second.succeeded());
+  EXPECT_LT(first.value().barrier.members.front().offset,
+            second.value().barrier.members.front().offset);
+  EXPECT_EQ(first.value().barrier.members.size(), row.split ? 2u : 1u);
+  const auto exact = select_drop_barrier(
+      again.value(), {.exact = second.value(), .ordinal = std::numeric_limits<size_t>::max()},
+      error);
+  ASSERT_TRUE(exact.succeeded()) << error.message;
+  EXPECT_EQ(exact.value().barrier, second.value().barrier);
+  auto forged = second.value();
+  forged.barrier.members.front().bytes[0] ^= 1;
+  EXPECT_TRUE(
+      select_drop_barrier(inventory.value(), {.exact = forged, .ordinal = 0}, error).failed());
+  EXPECT_EQ(error.code, FaultMutationErrorCode::IncompleteSelection);
+  const auto emitted = apply_drop_barrier(context, exact.value(), error);
+  ASSERT_TRUE(emitted.succeeded()) << error.message;
+  const auto repeated = apply_drop_barrier(context, exact.value(), error);
+  ASSERT_TRUE(repeated.succeeded());
+  EXPECT_EQ(emitted.value().edit_result.image, repeated.value().edit_result.image);
+  EXPECT_TRUE(matches_drop_output(context, exact.value(), repeated.value().edit_result.image, error)
+                  .succeeded());
+  // A private handle cannot authorize modified public facts on a warmed context.
+  EXPECT_TRUE(apply_drop_barrier(context, forged, error).failed());
+  EXPECT_EQ(error.code, FaultMutationErrorCode::IncompleteSelection);
+}
+
+TEST(FaultDropBarrier, SelectorRejectsEmptyOutOfRangeAndUnboundExact) {
+  FaultMutationError error;
+  const FaultMutationContext empty(fixture({kMov, kEnd}));
+  const auto no_barriers = discover_drop_barriers(empty, "test_kernel", error);
+  ASSERT_TRUE(no_barriers.succeeded());
+  EXPECT_TRUE(select_drop_barrier(no_barriers.value(), {}, error).failed());
+  EXPECT_EQ(error.code, FaultMutationErrorCode::NoCandidates);
+  const FaultMutationContext context(fixture());
+  const auto inventory = discover_drop_barriers(context, "test_kernel", error);
+  ASSERT_TRUE(inventory.succeeded());
+  EXPECT_TRUE(select_drop_barrier(
+                  inventory.value(),
+                  {.exact = std::nullopt, .ordinal = std::numeric_limits<size_t>::max()}, error)
+                  .failed());
+  EXPECT_EQ(error.code, FaultMutationErrorCode::OrdinalOutOfRange);
+  EXPECT_TRUE(
+      select_drop_barrier(inventory.value(), {.exact = DropBarrierSelection{}, .ordinal = 0}, error)
+          .failed());
+  EXPECT_EQ(error.code, FaultMutationErrorCode::BadIdentity);
+}
+
+TEST(FaultDropBarrier, ExactSelectorRejectsOtherKernelAndEqualBytesInAnotherContext) {
+  const auto image = two_kernel_fixture();
+  const FaultMutationContext context(image), other(image);
+  FaultMutationError error;
+  const auto first = discover_drop_barriers(context, "test_kernel0", error);
+  const auto second = discover_drop_barriers(context, "test_kernel1", error);
+  const auto foreign = discover_drop_barriers(other, "test_kernel0", error);
+  ASSERT_TRUE(first.succeeded());
+  ASSERT_TRUE(second.succeeded());
+  ASSERT_TRUE(foreign.succeeded());
+  const auto selected = select_drop_barrier(first.value(), {}, error);
+  ASSERT_TRUE(selected.succeeded());
+  for (const auto *inventory : {&second.value(), &foreign.value()}) {
+    EXPECT_TRUE(
+        select_drop_barrier(*inventory, {.exact = selected.value(), .ordinal = 0}, error).failed());
+    EXPECT_EQ(error.code, FaultMutationErrorCode::BadIdentity);
+  }
+}
+
+TEST(FaultDropBarrier, CachedQualificationFailureDoesNotPoisonAnotherKernel) {
+  const FaultMutationContext context(two_kernel_fixture({kSignal, kEnd}));
+  FaultMutationError error;
+  EXPECT_TRUE(discover_drop_barriers(context, "test_kernel0", error).failed());
+  EXPECT_EQ(error.code, FaultMutationErrorCode::IncompleteSelection);
+  const auto good = discover_drop_barriers(context, "test_kernel1", error);
+  ASSERT_TRUE(good.succeeded()) << error.message;
+  const auto selected = select_drop_barrier(good.value(), {}, error);
+  ASSERT_TRUE(selected.succeeded());
+  const auto result = apply_drop_barrier(context, selected.value(), error);
+  ASSERT_TRUE(result.succeeded()) << error.message;
+  EXPECT_TRUE(
+      matches_drop_output(context, selected.value(), result.value().edit_result.image, error)
+          .succeeded());
+  EXPECT_TRUE(discover_drop_barriers(context, "test_kernel0", error).failed());
+  EXPECT_EQ(error.code, FaultMutationErrorCode::IncompleteSelection);
+}
+
 TEST_P(FaultDropBarrierFamily, CompleteLogicalBarrierPreservesTargetWaveAndOtherBarrier) {
   const DropTargetRow &row = GetParam();
   const auto image = row_fixture(row, row_words(row));
@@ -136,8 +288,8 @@ TEST_P(FaultDropBarrierFamily, CompleteLogicalBarrierPreservesTargetWaveAndOther
   FaultMutationError error;
   const auto inventory = discover_drop_barriers(context, "test_kernel", error);
   ASSERT_TRUE(inventory.succeeded()) << error.message;
-  ASSERT_EQ(inventory.value().barriers.size(), 2u);
-  const auto selection = inventory.value().select(inventory.value().barriers.back());
+  ASSERT_EQ(inventory.value().barriers().size(), 2u);
+  const auto selection = selection_from(inventory.value(), inventory.value().barriers().size() - 1);
   const auto result = apply_drop_barrier(context, selection, error);
   ASSERT_TRUE(result.succeeded()) << error.message;
   EXPECT_EQ(result.value().logical_mutation_count, 1u);
@@ -146,16 +298,16 @@ TEST_P(FaultDropBarrierFamily, CompleteLogicalBarrierPreservesTargetWaveAndOther
   auto expected = image;
   const uint32_t nop = build_s_nop(0, row.arch);
   for (const auto &member : selection.barrier.members)
-    std::memcpy(expected.data() + inventory.value().section.file_offset + member.offset, &nop,
+    std::memcpy(expected.data() + inventory.value().section().file_offset + member.offset, &nop,
                 sizeof(nop));
   EXPECT_EQ(result.value().edit_result.image, expected);
-  EXPECT_TRUE(validate_drop_barrier_candidate(context, selection, expected, error).succeeded())
+  EXPECT_TRUE(matches_drop_output(context, selection, expected, error).succeeded())
       << error.message;
   const FaultMutationContext mutant(expected);
   const auto remaining = discover_drop_barriers(mutant, "test_kernel", error);
   ASSERT_TRUE(remaining.succeeded()) << error.message;
-  ASSERT_EQ(remaining.value().barriers.size(), 1u);
-  EXPECT_EQ(remaining.value().barriers.front(), inventory.value().barriers.front());
+  ASSERT_EQ(remaining.value().barriers().size(), 1u);
+  EXPECT_EQ(remaining.value().barriers().front(), inventory.value().barriers().front());
   const Section &text = *mutant.source().text_sections().front();
   const auto kernels = scan_kernel_descriptors(mutant.image(), text.sectionOffset(), text.size(),
                                                text.sectionHeaderIndex());
@@ -175,29 +327,30 @@ TEST_P(FaultDropBarrierFamily, ExactSiblingSelectionAndCandidateCorruption) {
     const auto sibling = discover_drop_barriers(
         context, entry == "test_kernel0" ? "test_kernel1" : "test_kernel0", error);
     ASSERT_TRUE(sibling.succeeded()) << error.message;
-    const auto selection = inventory.value().select(inventory.value().barriers.back());
+    const auto selection =
+        selection_from(inventory.value(), inventory.value().barriers().size() - 1);
     const auto result = apply_drop_barrier(context, selection, error);
     ASSERT_TRUE(result.succeeded()) << error.message;
     auto expected = image;
     const uint32_t nop = build_s_nop(0, row.arch);
     for (const auto &member : selection.barrier.members)
-      std::memcpy(expected.data() + inventory.value().section.file_offset + member.offset, &nop,
+      std::memcpy(expected.data() + inventory.value().section().file_offset + member.offset, &nop,
                   sizeof(nop));
     EXPECT_EQ(result.value().edit_result.image, expected);
     const FaultMutationContext mutant(expected);
-    const auto fresh_sibling = discover_drop_barriers(mutant, sibling.value().owner.entry, error);
+    const auto fresh_sibling = discover_drop_barriers(mutant, sibling.value().owner().entry, error);
     ASSERT_TRUE(fresh_sibling.succeeded()) << error.message;
-    EXPECT_EQ(fresh_sibling.value().barriers, sibling.value().barriers);
-    const uint64_t text = inventory.value().section.file_offset;
+    EXPECT_TRUE(std::ranges::equal(fresh_sibling.value().barriers(), sibling.value().barriers()));
+    const uint64_t text = inventory.value().section().file_offset;
     for (const uint64_t offset :
-         {text + inventory.value().barriers.front().members.front().offset,
-          text + inventory.value().owner.entry_offset,
+         {text + inventory.value().barriers().front().members.front().offset,
+          text + inventory.value().owner().entry_offset,
           text + selection.barrier.members.front().offset,
-          sibling.value().owner.descriptor_file_offset, uint64_t{offsetof(Elf64_Ehdr, e_flags)}}) {
+          sibling.value().owner().descriptor_file_offset,
+          uint64_t{offsetof(Elf64_Ehdr, e_flags)}}) {
       auto corrupted = expected;
       corrupted[offset] ^= 1;
-      EXPECT_TRUE(validate_drop_barrier_candidate(context, selection, corrupted, error).failed())
-          << offset;
+      EXPECT_TRUE(matches_drop_output(context, selection, corrupted, error).failed()) << offset;
       EXPECT_EQ(error.code, FaultMutationErrorCode::ValidationFailure);
     }
   }
@@ -225,11 +378,11 @@ TEST_P(FaultDropBarrierFamily, PreservesAdditionalExecutableSection) {
   auto expected = image;
   const uint32_t nop = build_s_nop(0, row.arch);
   for (const auto &member : selection.barrier.members)
-    std::memcpy(expected.data() + inventory.value().section.file_offset + member.offset, &nop, 4);
+    std::memcpy(expected.data() + inventory.value().section().file_offset + member.offset, &nop, 4);
   EXPECT_EQ(result.value().edit_result.image, expected);
-  EXPECT_TRUE(validate_drop_barrier_candidate(context, selection, expected, error).succeeded());
+  EXPECT_TRUE(matches_drop_output(context, selection, expected, error).succeeded());
   expected[section.sh_offset] ^= 1;
-  EXPECT_TRUE(validate_drop_barrier_candidate(context, selection, expected, error).failed());
+  EXPECT_TRUE(matches_drop_output(context, selection, expected, error).failed());
   EXPECT_EQ(error.code, FaultMutationErrorCode::ValidationFailure);
 }
 
@@ -292,8 +445,8 @@ TEST_P(FaultDropBarrierFamily, StaticBarrierInLoopAndFamilySpecificForms) {
         EXPECT_EQ(error.code, FaultMutationErrorCode::UnsupportedForm);
       } else {
         ASSERT_TRUE(discovered.succeeded()) << error.message;
-        ASSERT_EQ(discovered.value().barriers.size(), 1u);
-        EXPECT_EQ(discovered.value().barriers.front().scope,
+        ASSERT_EQ(discovered.value().barriers().size(), 1u);
+        EXPECT_EQ(discovered.value().barriers().front().scope,
                   id >= -2 ? StaticBarrierScope::Workgroup : StaticBarrierScope::Cluster);
         EXPECT_TRUE(
             apply_drop_barrier(builtin, selection_from(discovered.value()), error).succeeded())
@@ -330,13 +483,14 @@ TEST(FaultDropBarrier, RejectsUndecodableUnselectedRdnaPadding) {
     const FaultMutationContext context(image);
     FaultMutationError error;
     const auto inventory = discover_drop_barriers(context, "test_kernel0", error);
-    ASSERT_TRUE(inventory.succeeded()) << error.message;
-    EXPECT_TRUE(apply_drop_barrier(context, selection_from(inventory.value()), error).failed());
-    EXPECT_EQ(error.code, FaultMutationErrorCode::ValidationFailure);
+    // Full-text input facts are built once, before exposing a selectable inventory.
+    EXPECT_TRUE(inventory.failed());
+    EXPECT_EQ(error.code, FaultMutationErrorCode::UnsupportedForm);
+    EXPECT_FALSE(error.message.empty());
   }
 }
 
-TEST(FaultDropBarrier, ConcreteGfx1251DecoderSurvivesAllValidationStages) {
+TEST(FaultDropBarrier, ConcreteGfx1251DecoderSurvivesSourceAndEmitterChecks) {
   const DropTargetRow &variant = kDropRows[5];
   auto words = row_words(variant);
   // Already used in InstrumentorProbePatch: gfx1251-only VOP3P, legal only with its features.
@@ -351,12 +505,11 @@ TEST(FaultDropBarrier, ConcreteGfx1251DecoderSurvivesAllValidationStages) {
   ASSERT_TRUE(result.succeeded()) << error.message;
   EXPECT_EQ(result.value().edit_result.target, ROCJITSU_CODE_TARGET_GFX1251);
   EXPECT_EQ(
-      std::memcmp(result.value().edit_result.image.data() + inventory.value().section.file_offset,
-                  image.data() + inventory.value().section.file_offset, 8),
+      std::memcmp(result.value().edit_result.image.data() + inventory.value().section().file_offset,
+                  image.data() + inventory.value().section().file_offset, 8),
       0);
   EXPECT_TRUE(
-      validate_drop_barrier_candidate(context, selection, result.value().edit_result.image, error)
-          .succeeded());
+      matches_drop_output(context, selection, result.value().edit_result.image, error).succeeded());
   const FaultMutationContext wrong_variant(row_fixture(kDropRows[4], words));
   EXPECT_TRUE(discover_drop_barriers(wrong_variant, "test_kernel", error).failed());
   EXPECT_EQ(error.code, FaultMutationErrorCode::UnsupportedForm);
@@ -392,7 +545,7 @@ TEST(FaultDropBarrier, ExactKernelSelectionPreservesIndependentSibling) {
     FaultMutationError error;
     const auto inventory = discover_drop_barriers(context, entry, error);
     ASSERT_TRUE(inventory.succeeded()) << error.message;
-    ASSERT_EQ(inventory.value().barriers.size(), 1u);
+    ASSERT_EQ(inventory.value().barriers().size(), 1u);
     const std::string sibling_entry = entry == "test_kernel0" ? "test_kernel1" : "test_kernel0";
     const auto sibling = discover_drop_barriers(context, sibling_entry, error);
     ASSERT_TRUE(sibling.succeeded()) << error.message;
@@ -402,7 +555,7 @@ TEST(FaultDropBarrier, ExactKernelSelectionPreservesIndependentSibling) {
     auto expected = image;
     const uint32_t nop = build_s_nop(0, kArch);
     for (const auto &member : selection.barrier.members)
-      std::memcpy(expected.data() + inventory.value().section.file_offset + member.offset, &nop,
+      std::memcpy(expected.data() + inventory.value().section().file_offset + member.offset, &nop,
                   sizeof(nop));
     EXPECT_EQ(result.value().edit_result.image, expected);
     const FaultMutationContext mutant(expected);
@@ -410,15 +563,15 @@ TEST(FaultDropBarrier, ExactKernelSelectionPreservesIndependentSibling) {
     const auto fresh_sibling = discover_drop_barriers(mutant, sibling_entry, error);
     ASSERT_TRUE(fresh.succeeded()) << error.message;
     ASSERT_TRUE(fresh_sibling.succeeded()) << error.message;
-    EXPECT_TRUE(fresh.value().barriers.empty());
-    EXPECT_EQ(fresh_sibling.value().owner, sibling.value().owner);
-    EXPECT_EQ(fresh_sibling.value().barriers, sibling.value().barriers);
+    EXPECT_TRUE(fresh.value().barriers().empty());
+    EXPECT_EQ(fresh_sibling.value().owner(), sibling.value().owner());
+    EXPECT_TRUE(std::ranges::equal(fresh_sibling.value().barriers(), sibling.value().barriers()));
     for (const uint64_t offset :
-         {sibling.value().owner.descriptor_file_offset,
-          sibling.value().section.file_offset + sibling.value().owner.entry_offset}) {
+         {sibling.value().owner().descriptor_file_offset,
+          sibling.value().section().file_offset + sibling.value().owner().entry_offset}) {
       auto corrupted = expected;
       corrupted[offset] ^= 1;
-      EXPECT_TRUE(validate_drop_barrier_candidate(context, selection, corrupted, error).failed());
+      EXPECT_TRUE(matches_drop_output(context, selection, corrupted, error).failed());
       EXPECT_EQ(error.code, FaultMutationErrorCode::ValidationFailure);
     }
   }
@@ -448,8 +601,7 @@ TEST(FaultDropBarrier, SelectionRejectsAnotherContextEvenWithIdenticalBytes) {
   EXPECT_TRUE(apply_drop_barrier(other, selection, error).failed());
   EXPECT_EQ(error.code, FaultMutationErrorCode::BadIdentity);
   EXPECT_TRUE(
-      validate_drop_barrier_candidate(other, selection, result.value().edit_result.image, error)
-          .failed());
+      matches_drop_output(other, selection, result.value().edit_result.image, error).failed());
   EXPECT_EQ(error.code, FaultMutationErrorCode::BadIdentity);
 }
 
@@ -467,11 +619,10 @@ TEST(FaultDropBarrier, ExpiredSelectionAndInventoryCannotBindANewContext) {
   context.emplace(image); // Reuse the context's address, not its source lifetime.
   EXPECT_TRUE(apply_drop_barrier(*context, selection, error).failed());
   EXPECT_EQ(error.code, FaultMutationErrorCode::BadIdentity);
-  EXPECT_TRUE(apply_drop_barrier(*context, selection_from(inventory.value()), error).failed());
+  EXPECT_TRUE(select_drop_barrier(inventory.value(), {}, error).failed());
   EXPECT_EQ(error.code, FaultMutationErrorCode::BadIdentity);
   EXPECT_TRUE(
-      validate_drop_barrier_candidate(*context, selection, result.value().edit_result.image, error)
-          .failed());
+      matches_drop_output(*context, selection, result.value().edit_result.image, error).failed());
   EXPECT_EQ(error.code, FaultMutationErrorCode::BadIdentity);
 }
 
@@ -484,7 +635,7 @@ TEST(FaultDropBarrier, SourceSnapshotSurvivesCallerEditsButSelectionCannotReplay
   ASSERT_TRUE(inventory.succeeded()) << error.message;
   const auto selection = selection_from(inventory.value());
   const uint32_t changed_mov = 0xbe800082u;
-  std::memcpy(image.data() + inventory.value().section.file_offset + 8, &changed_mov, 4);
+  std::memcpy(image.data() + inventory.value().section().file_offset + 8, &changed_mov, 4);
   EXPECT_TRUE(std::ranges::equal(context.image(), original));
   const FaultMutationContext changed(image);
   EXPECT_TRUE(apply_drop_barrier(changed, selection, error).failed());
@@ -504,7 +655,7 @@ TEST(FaultDropBarrier, ExactSelectionRejectsDuplicateNamesAndSiblingOwnerSubstit
   ASSERT_TRUE(first.succeeded());
   ASSERT_TRUE(second.succeeded());
   auto selection = selection_from(first.value());
-  selection.owner = second.value().owner;
+  selection.owner = second.value().owner();
   EXPECT_TRUE(apply_drop_barrier(context, selection, error).failed());
   EXPECT_EQ(error.code, FaultMutationErrorCode::IncompleteSelection);
   EXPECT_TRUE(discover_drop_barriers(context, "test_kernel", error).failed());
@@ -594,13 +745,13 @@ TEST(FaultDropBarrier, PreservesUnselectedSectionButRejectsActualTextRelocations
   auto expected = image;
   const uint32_t nop = build_s_nop(0, kArch);
   for (const auto &member : selection.barrier.members)
-    std::memcpy(expected.data() + inventory.value().section.file_offset + member.offset, &nop, 4);
+    std::memcpy(expected.data() + inventory.value().section().file_offset + member.offset, &nop, 4);
   EXPECT_EQ(result.value().edit_result.image, expected);
   const CodeObjectPatcher updated(context.source());
   auto sections = updated.section_headers();
   auto &extra = sections.back();
   extra.sh_type = SHT_RELA;
-  extra.sh_info = inventory.value().section.index;
+  extra.sh_info = inventory.value().section().index;
   extra.sh_entsize = sizeof(Elf64_Rela);
   for (size_t index = 0; index < sections.size(); ++index)
     if (sections[index].sh_type == SHT_SYMTAB)
@@ -698,7 +849,7 @@ TEST(FaultDropBarrier, LongSameBlockPairUsesCompleteMembersWithoutDistanceCutoff
   FaultMutationError error;
   const auto inventory = discover_drop_barriers(context, "test_kernel", error);
   ASSERT_TRUE(inventory.succeeded()) << error.message;
-  ASSERT_EQ(inventory.value().barriers.size(), 1u);
+  ASSERT_EQ(inventory.value().barriers().size(), 1u);
   const auto result = apply_drop_barrier(context, selection_from(inventory.value()), error);
   ASSERT_TRUE(result.succeeded()) << error.message;
   EXPECT_EQ(result.value().logical_mutation_count, 1u);
@@ -728,13 +879,14 @@ void expect_load_mapping_rejection(const std::vector<uint8_t> &image) {
   std::vector<uint8_t> candidate = image;
   const uint32_t nop = build_s_nop(0, kArch);
   for (const StaticBarrierMember &member : selection.barrier.members)
-    std::memcpy(candidate.data() + inventory.value().section.file_offset + member.offset, &nop, 4);
+    std::memcpy(candidate.data() + inventory.value().section().file_offset + member.offset, &nop,
+                4);
   // No valid same-context selection can be obtained from failed discovery.
   EXPECT_TRUE(apply_drop_barrier(malformed, selection, error).failed());
   EXPECT_EQ(error.code, FaultMutationErrorCode::BadIdentity);
-  EXPECT_TRUE(validate_drop_barrier_candidate(malformed, selection, candidate, error).failed());
+  EXPECT_TRUE(matches_drop_output(malformed, selection, candidate, error).failed());
   EXPECT_EQ(error.code, FaultMutationErrorCode::BadIdentity);
-  EXPECT_TRUE(validate_drop_barrier_candidate(pristine, selection, candidate, error).failed());
+  EXPECT_TRUE(matches_drop_output(pristine, selection, candidate, error).failed());
   EXPECT_EQ(error.code, FaultMutationErrorCode::ValidationFailure);
 }
 
@@ -833,8 +985,7 @@ TEST(FaultDropBarrier, AcceptsFileBackedRangesInsideLargerLoadSegments) {
   const auto result = apply_drop_barrier(context, selection, error);
   ASSERT_TRUE(result.succeeded()) << error.message;
   EXPECT_TRUE(
-      validate_drop_barrier_candidate(context, selection, result.value().edit_result.image, error)
-          .succeeded())
+      matches_drop_output(context, selection, result.value().edit_result.image, error).succeeded())
       << error.message;
 }
 
@@ -845,9 +996,9 @@ TEST(FaultDropBarrier, CompleteSeparatedPairPreservesGuestWaitsAndMetadata) {
   FailureOr<FaultBarrierInventory> inventory =
       discover_drop_barriers(context, "test_kernel", error);
   ASSERT_TRUE(inventory.succeeded()) << error.message;
-  ASSERT_EQ(inventory.value().barriers.size(), 1u);
-  EXPECT_EQ(inventory.value().barriers.front().members[0].offset, 4u);
-  EXPECT_EQ(inventory.value().barriers.front().members[1].offset, 12u);
+  ASSERT_EQ(inventory.value().barriers().size(), 1u);
+  EXPECT_EQ(inventory.value().barriers().front().members[0].offset, 4u);
+  EXPECT_EQ(inventory.value().barriers().front().members[1].offset, 12u);
   const DropBarrierSelection selection = selection_from(inventory.value());
   FailureOr<DropBarrierResult> result = apply_drop_barrier(context, selection, error);
   ASSERT_TRUE(result.succeeded()) << error.message;
@@ -859,14 +1010,14 @@ TEST(FaultDropBarrier, CompleteSeparatedPairPreservesGuestWaitsAndMetadata) {
   std::vector<uint8_t> expected = image;
   const uint32_t nop = build_s_nop(0, kArch);
   for (const uint64_t offset : {4u, 12u})
-    std::memcpy(expected.data() + inventory.value().section.file_offset + offset, &nop, 4);
+    std::memcpy(expected.data() + inventory.value().section().file_offset + offset, &nop, 4);
   EXPECT_EQ(result.value().edit_result.image, expected);
-  EXPECT_TRUE(validate_drop_barrier_candidate(context, selection, expected, error).succeeded())
+  EXPECT_TRUE(matches_drop_output(context, selection, expected, error).succeeded())
       << error.message;
   const FaultMutationContext mutant(expected);
   FailureOr<FaultBarrierInventory> fresh = discover_drop_barriers(mutant, "test_kernel", error);
   ASSERT_TRUE(fresh.succeeded()) << error.message;
-  EXPECT_TRUE(fresh.value().barriers.empty());
+  EXPECT_TRUE(fresh.value().barriers().empty());
   EXPECT_TRUE(apply_drop_barrier(mutant, selection, error).failed());
   EXPECT_EQ(error.code, FaultMutationErrorCode::BadIdentity);
 }
@@ -878,15 +1029,15 @@ TEST(FaultDropBarrier, ExactSecondPairSelectionLeavesRedundantFirstBarrier) {
   FailureOr<FaultBarrierInventory> inventory =
       discover_drop_barriers(context, "test_kernel", error);
   ASSERT_TRUE(inventory.succeeded()) << error.message;
-  ASSERT_EQ(inventory.value().barriers.size(), 2u);
+  ASSERT_EQ(inventory.value().barriers().size(), 2u);
   FailureOr<DropBarrierResult> result =
       apply_drop_barrier(context, selection_from(inventory.value(), 1), error);
   ASSERT_TRUE(result.succeeded()) << error.message;
   FailureOr<FaultBarrierInventory> fresh = discover_drop_barriers(
       FaultMutationContext(result.value().edit_result.image), "test_kernel", error);
   ASSERT_TRUE(fresh.succeeded()) << error.message;
-  ASSERT_EQ(fresh.value().barriers.size(), 1u);
-  EXPECT_EQ(fresh.value().barriers.front(), inventory.value().barriers.front());
+  ASSERT_EQ(fresh.value().barriers().size(), 1u);
+  EXPECT_EQ(fresh.value().barriers().front(), inventory.value().barriers().front());
   EXPECT_EQ(result.value().detector_qualification, FaultQualification::Unverified);
 }
 
@@ -971,7 +1122,7 @@ TEST(FaultDropBarrier, SameBlockStaticPairInCycleAffectsAllOccurrences) {
   FailureOr<FaultBarrierInventory> inventory =
       discover_drop_barriers(context, "test_kernel", error);
   ASSERT_TRUE(inventory.succeeded()) << error.message;
-  ASSERT_EQ(inventory.value().barriers.size(), 1u);
+  ASSERT_EQ(inventory.value().barriers().size(), 1u);
   FailureOr<DropBarrierResult> result =
       apply_drop_barrier(context, selection_from(inventory.value()), error);
   ASSERT_TRUE(result.succeeded()) << error.message;
@@ -1017,7 +1168,7 @@ TEST(FaultDropBarrier, RejectsForeignHeadersAndNonexactEntry) {
   EXPECT_EQ(error.code, FaultMutationErrorCode::UnsupportedTarget);
 }
 
-TEST(FaultDropBarrier, IndependentValidatorRejectsHalfDropAndUnrelatedCorruption) {
+TEST(FaultDropBarrier, EmitterOracleRejectsHalfDropAndUnrelatedCorruption) {
   const std::vector<uint8_t> image = fixture();
   const FaultMutationContext context(image);
   FaultMutationError error;
@@ -1031,10 +1182,9 @@ TEST(FaultDropBarrier, IndependentValidatorRejectsHalfDropAndUnrelatedCorruption
        {size_t{0x104}, size_t{0x10c}, size_t{0x108}, size_t{0x110}, size_t{0x118}, size_t{48}}) {
     std::vector<uint8_t> candidate = result.value().edit_result.image;
     candidate[offset] ^= 1;
-    EXPECT_TRUE(validate_drop_barrier_candidate(context, selection, candidate, error).failed())
-        << offset;
+    EXPECT_TRUE(matches_drop_output(context, selection, candidate, error).failed()) << offset;
   }
-  EXPECT_TRUE(validate_drop_barrier_candidate(context, selection, image, error).failed());
+  EXPECT_TRUE(matches_drop_output(context, selection, image, error).failed());
 }
 
 TEST(FaultDropBarrier, CapabilityDescribesTransformationOnly) {
@@ -1069,9 +1219,9 @@ TEST(FaultDropBarrier, BuiltinIdsKeepDistinctStaticScopes) {
     FailureOr<FaultBarrierInventory> inventory =
         discover_drop_barriers(context, "test_kernel", error);
     ASSERT_TRUE(inventory.succeeded()) << error.message;
-    ASSERT_EQ(inventory.value().barriers.size(), 1u);
-    EXPECT_EQ(inventory.value().barriers.front().barrier_id, id);
-    EXPECT_EQ(inventory.value().barriers.front().scope,
+    ASSERT_EQ(inventory.value().barriers().size(), 1u);
+    EXPECT_EQ(inventory.value().barriers().front().barrier_id, id);
+    EXPECT_EQ(inventory.value().barriers().front().scope,
               id >= -2 ? StaticBarrierScope::Workgroup : StaticBarrierScope::Cluster);
     EXPECT_TRUE(apply_drop_barrier(context, selection_from(inventory.value()), error).succeeded())
         << error.message;
@@ -1171,8 +1321,8 @@ TEST(FaultDropBarrier, PinnedCompiledCorpusCompleteDrop) {
   constexpr std::string_view entry = "_Z16fa_barrier_epochPKtPjj";
   FailureOr<FaultBarrierInventory> inventory = discover_drop_barriers(context, entry, error);
   ASSERT_TRUE(inventory.succeeded()) << error.message;
-  ASSERT_EQ(inventory.value().barriers.size(), 1u);
-  const StaticBarrier &group = inventory.value().barriers.front();
+  ASSERT_EQ(inventory.value().barriers().size(), 1u);
+  const StaticBarrier &group = inventory.value().barriers().front();
   EXPECT_EQ(group.barrier_id, -1);
   EXPECT_EQ(group.scope, StaticBarrierScope::Workgroup);
   ASSERT_EQ(group.members.size(), 2u);
@@ -1181,8 +1331,8 @@ TEST(FaultDropBarrier, PinnedCompiledCorpusCompleteDrop) {
       apply_drop_barrier(context, selection_from(inventory.value()), error);
   ASSERT_TRUE(result.succeeded()) << error.message;
   EXPECT_EQ(result.value().edit_result.edits.size(), 2u);
-  EXPECT_TRUE(validate_drop_barrier_candidate(context, result.value().selection,
-                                              result.value().edit_result.image, error)
+  EXPECT_TRUE(matches_drop_output(context, result.value().selection,
+                                  result.value().edit_result.image, error)
                   .succeeded())
       << error.message;
   std::ofstream output(RJ_FAULT_CORPUS_MUTANT, std::ios::binary | std::ios::trunc);

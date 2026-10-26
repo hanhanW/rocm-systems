@@ -10,6 +10,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <cstring>
 #include <limits>
 
@@ -35,6 +36,67 @@ std::vector<CheckedTextEdit> edits() {
           {20, bytes({0xee068002u, 0x00800000u, 0}), bytes({nop, nop, nop})}};
 }
 
+// Test-side exact-image oracle, independent of the production transaction.
+Result matches_checked_output(const AmdGpuCodeObject &source,
+                              std::span<const CheckedTextEdit> edits,
+                              std::span<const uint8_t> candidate, TextEditError &error) {
+  const auto *data = reinterpret_cast<const uint8_t *>(source.image_data());
+  std::vector<uint8_t> expected(data, data + source.image_size());
+  const Section &text = *source.text_sections().front();
+  for (const auto &edit : edits) {
+    if (edit.offset > text.size() || edit.replacement.size() > text.size() - edit.offset)
+      return Result::failure();
+    std::memcpy(expected.data() + text.sectionOffset() + edit.offset, edit.replacement.data(),
+                edit.replacement.size());
+  }
+  const AmdGpuCodeObject parsed(candidate.data(), candidate.size());
+  if (!parsed.is_valid() || parsed.target_id() != source.target_id() ||
+      !std::ranges::equal(expected, candidate)) {
+    error = {TextEditErrorCode::ValidationFailure, 0, "test oracle: unexpected output bytes"};
+    return Result::failure();
+  }
+  return Result::success();
+}
+
+TEST(CheckedTextEdits, ReusableFactsKeepRequestChecksAndSourceIdentity) {
+  const auto image = fixture();
+  const AmdGpuCodeObject source(image.data(), image.size());
+  TextEditError error;
+  auto context = CheckedTextEditContext::create(source, error);
+  ASSERT_TRUE(context.succeeded()) << error.message;
+  const auto original_edits = edits();
+  for (int attempt = 0; attempt < 2; ++attempt) {
+    const auto result = apply_checked_text_edits(*context.value(), original_edits, error);
+    ASSERT_TRUE(result.succeeded()) << error.message;
+    EXPECT_TRUE(
+        matches_checked_output(source, original_edits, result.value().image, error).succeeded());
+    auto stale = original_edits;
+    stale.back().expected[0] ^= 1;
+    EXPECT_TRUE(apply_checked_text_edits(*context.value(), stale, error).failed());
+    EXPECT_EQ(error.code, TextEditErrorCode::StaleBytes);
+    auto invalid = original_edits;
+    invalid.back().replacement.assign(12, 0xff);
+    EXPECT_TRUE(apply_checked_text_edits(*context.value(), invalid, error).failed());
+    EXPECT_EQ(error.code, TextEditErrorCode::InvalidInstruction);
+  }
+  EXPECT_EQ(std::memcmp(source.image_data(), image.data(), image.size()), 0);
+}
+
+TEST(CheckedTextEdits, CachedFullTextFactsIncludeUnreachableReferences) {
+  const auto image = test::make_gfx1200_kernel_elf(
+      {0xbe8000ffu, 0x12345678u, build_s_endpgm(kArch), build_s_branch(-3, kArch)}, 0);
+  const AmdGpuCodeObject source(image.data(), image.size());
+  TextEditError error;
+  auto context = CheckedTextEditContext::create(source, error);
+  ASSERT_TRUE(context.succeeded()) << error.message;
+  const uint32_t nop = build_s_nop(0, kArch);
+  const CheckedTextEdit edit{0, bytes({0xbe8000ffu, 0x12345678u}), bytes({nop, nop})};
+  for (int attempt = 0; attempt < 2; ++attempt) {
+    EXPECT_TRUE(apply_checked_text_edits(*context.value(), std::span(&edit, 1), error).failed());
+    EXPECT_EQ(error.code, TextEditErrorCode::UnsupportedReferences) << error.message;
+  }
+}
+
 TEST(CheckedTextEdits, ThreeNonadjacentCompleteExtentsPreserveAllOtherImageBytes) {
   const std::vector<uint8_t> image = fixture();
   const AmdGpuCodeObject object(image.data(), image.size());
@@ -54,8 +116,7 @@ TEST(CheckedTextEdits, ThreeNonadjacentCompleteExtentsPreserveAllOtherImageBytes
   EXPECT_EQ(result.value().mapping.front().candidate_offset, 0u);
   EXPECT_EQ(result.value().mapping.front().size, 36u);
   EXPECT_EQ(std::memcmp(object.image_data(), image.data(), image.size()), 0);
-  EXPECT_TRUE(
-      validate_checked_text_candidate(object, requests, result.value().image, error).succeeded())
+  EXPECT_TRUE(matches_checked_output(object, requests, result.value().image, error).succeeded())
       << error.message;
 }
 
@@ -70,8 +131,7 @@ TEST(CheckedTextEdits, SectionOnlyTransformationDoesNotRequireLoadMapping) {
   const auto requests = edits();
   const auto result = apply_checked_text_edits(object, requests, error);
   ASSERT_TRUE(result.succeeded()) << error.message;
-  EXPECT_TRUE(
-      validate_checked_text_candidate(object, requests, result.value().image, error).succeeded())
+  EXPECT_TRUE(matches_checked_output(object, requests, result.value().image, error).succeeded())
       << error.message;
 }
 
@@ -91,8 +151,7 @@ TEST(CheckedTextEdits, Gfx1100CallableConsumerRetainsSourceTarget) {
   auto expected = image;
   std::memcpy(expected.data() + source.text_sections().front()->sectionOffset(), &nop, sizeof(nop));
   EXPECT_EQ(result.value().image, expected);
-  EXPECT_TRUE(
-      validate_checked_text_candidate(source, requests, result.value().image, error).succeeded());
+  EXPECT_TRUE(matches_checked_output(source, requests, result.value().image, error).succeeded());
 }
 
 TEST(CheckedTextEdits, LegacyElfIdentityIsSourceDerivedAndUnchanged) {
@@ -111,7 +170,7 @@ TEST(CheckedTextEdits, LegacyElfIdentityIsSourceDerivedAndUnchanged) {
   std::memcpy(expected.data() + result.value().section.file_offset,
               requests.front().replacement.data(), 4);
   EXPECT_EQ(result.value().image, expected);
-  EXPECT_TRUE(validate_checked_text_candidate(source, requests, expected, error).succeeded());
+  EXPECT_TRUE(matches_checked_output(source, requests, expected, error).succeeded());
   for (const uint32_t machine :
        {EF_AMDGPU_MACH_NONE, uint32_t{0xfe}, EF_AMDGPU_MACH_AMDGCN_GFX1010}) {
     auto corrupt = expected;
@@ -119,7 +178,7 @@ TEST(CheckedTextEdits, LegacyElfIdentityIsSourceDerivedAndUnchanged) {
     std::memcpy(&header, corrupt.data(), sizeof(header));
     header.e_flags = machine;
     std::memcpy(corrupt.data(), &header, sizeof(header));
-    EXPECT_TRUE(validate_checked_text_candidate(source, requests, corrupt, error).failed());
+    EXPECT_TRUE(matches_checked_output(source, requests, corrupt, error).failed());
     if (machine != EF_AMDGPU_MACH_AMDGCN_GFX1010) {
       const AmdGpuCodeObject unknown(corrupt.data(), corrupt.size());
       EXPECT_TRUE(apply_checked_text_edits(unknown, requests, error).failed());
@@ -199,7 +258,7 @@ TEST(CheckedTextEdits, RejectsTruncatedOriginalEightAndTwelveByteInstructions) {
   }
 }
 
-TEST(CheckedTextEdits, IndependentValidatorRejectsTextMetadataAndTargetCorruption) {
+TEST(CheckedTextEdits, EmitterOracleRejectsTextMetadataAndTargetCorruption) {
   const std::vector<uint8_t> image = fixture();
   const AmdGpuCodeObject object(image.data(), image.size());
   const std::vector<CheckedTextEdit> requests = edits();
@@ -209,8 +268,7 @@ TEST(CheckedTextEdits, IndependentValidatorRejectsTextMetadataAndTargetCorruptio
   for (const size_t offset : {size_t{0x104}, size_t{0x100}, size_t{48}, size_t{0x100 + 36}}) {
     std::vector<uint8_t> candidate = result.value().image;
     candidate[offset] ^= 1;
-    EXPECT_TRUE(validate_checked_text_candidate(object, requests, candidate, error).failed())
-        << offset;
+    EXPECT_TRUE(matches_checked_output(object, requests, candidate, error).failed()) << offset;
   }
   std::vector<uint8_t> unknown = image;
   Elf64_Ehdr header{};
@@ -314,9 +372,9 @@ TEST(CheckedTextEdits, PreservesAdditionalExecutableSection) {
     std::memcpy(expected.data() + result.value().section.file_offset + edit.offset,
                 edit.replacement.data(), edit.replacement.size());
   EXPECT_EQ(result.value().image, expected);
-  EXPECT_TRUE(validate_checked_text_candidate(object, requests, expected, error).succeeded());
+  EXPECT_TRUE(matches_checked_output(object, requests, expected, error).succeeded());
   expected[section.sh_offset] ^= 1;
-  EXPECT_TRUE(validate_checked_text_candidate(object, requests, expected, error).failed());
+  EXPECT_TRUE(matches_checked_output(object, requests, expected, error).failed());
 }
 
 TEST(CheckedTextEdits, RejectsAliasedSections) {

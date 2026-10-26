@@ -7,6 +7,7 @@
 #include "rocjitsu/code/patch/checked_text_edits.h"
 
 #include <memory>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -24,6 +25,8 @@ enum class FaultMutationErrorCode {
   IncompleteSelection,
   InvalidParameters,
   ValidationFailure,
+  NoCandidates,
+  OrdinalOutOfRange,
 };
 struct FaultMutationError {
   FaultMutationErrorCode code = FaultMutationErrorCode::None;
@@ -38,15 +41,19 @@ struct FaultMutationOwner {
 };
 
 class FaultBarrierInventory;
+class DropBarrierSelection;
+struct FaultBarrierRecord;
 
 /// @brief Own an immutable source snapshot and its selection lifetime.
 /// @details Copies the input once. Independently constructed contexts have distinct
 /// identities even for identical bytes. The owned code object supplies the target;
-/// changing the caller's input buffer does not change this snapshot. This is the
-/// bounded FI01 frontend context, not a shared helper/indirect-analysis cache.
+/// changing the caller's input buffer does not change this snapshot. The context
+/// caches the fixed all-entry direct-ownership profile and full-text edit facts.
+/// It does not support alternate roots/ranges/options or helper/indirect-analysis profiles.
 class FaultMutationContext {
 public:
   explicit FaultMutationContext(std::span<const uint8_t> image);
+  ~FaultMutationContext();
   FaultMutationContext(const FaultMutationContext &) = delete;
   FaultMutationContext &operator=(const FaultMutationContext &) = delete;
 
@@ -54,42 +61,69 @@ public:
   std::span<const uint8_t> image() const;
 
 private:
+  class State;
+  Result analyze() const;
   const std::shared_ptr<const AmdGpuCodeObject> source_;
+  std::unique_ptr<State> state_;
+  friend FailureOr<struct DropBarrierResult> apply_drop_barrier(const FaultMutationContext &,
+                                                                const DropBarrierSelection &,
+                                                                FaultMutationError &);
   friend FailureOr<FaultBarrierInventory>
   discover_drop_barriers(const FaultMutationContext &, std::string_view, FaultMutationError &);
 };
 
-/// @brief Select one complete logical barrier in its original context.
-/// @details Value facts are re-resolved on apply, not trusted as proof. The private
-/// weak binding rejects cross-context and expired selections without a digest,
-/// raw pointer identity, or durable replay contract.
+/// @brief Context-bound exact handle with inspectable selection facts.
+/// @details Apply checks value facts against the immutable private record, without
+/// rediscovery. Mutating the public facts cannot authorize different members.
 class DropBarrierSelection {
 public:
   FaultMutationKind kind = FaultMutationKind::DropBarrier;
   FaultMutationOwner owner;
   StaticBarrier barrier;
-
   bool belongs_to(const FaultMutationContext &context) const;
 
 private:
   std::weak_ptr<const AmdGpuCodeObject> source_;
-  friend class FaultBarrierInventory;
+  std::weak_ptr<const FaultBarrierRecord> record_;
+  size_t ordinal_ = 0;
+  Result resolve(FaultMutationError &error) const;
+  friend FailureOr<DropBarrierSelection> select_drop_barrier(const FaultBarrierInventory &,
+                                                             const struct DropBarrierSelector &,
+                                                             FaultMutationError &);
+  friend FailureOr<struct DropBarrierResult> apply_drop_barrier(const FaultMutationContext &,
+                                                                const DropBarrierSelection &,
+                                                                FaultMutationError &);
 };
 
+/// @brief Read-only qualified records; retaining an inventory does not extend source lifetime.
 class FaultBarrierInventory {
 public:
-  TextSectionIdentity section;
-  FaultMutationOwner owner;
-  std::vector<StaticBarrier> barriers;
-
-  /// @brief Bind an explicitly chosen complete barrier; apply checks its exact current facts.
-  DropBarrierSelection select(const StaticBarrier &barrier) const;
+  const TextSectionIdentity &section() const;
+  const FaultMutationOwner &owner() const;
+  std::span<const StaticBarrier> barriers() const;
 
 private:
-  std::weak_ptr<const AmdGpuCodeObject> source_;
+  FaultBarrierInventory() = default;
+  std::shared_ptr<const FaultBarrierRecord> record_;
   friend FailureOr<FaultBarrierInventory>
   discover_drop_barriers(const FaultMutationContext &, std::string_view, FaultMutationError &);
+  friend FailureOr<DropBarrierSelection> select_drop_barrier(const FaultBarrierInventory &,
+                                                             const struct DropBarrierSelector &,
+                                                             FaultMutationError &);
 };
+
+/// @brief Exact wins over ordinal; ordinal counts complete logical barriers, not physical sites.
+struct DropBarrierSelector {
+  std::optional<DropBarrierSelection> exact;
+  size_t ordinal = 0;
+};
+
+/// @brief Select by exact handle or by zero-based source first-member order (default zero).
+/// @details Invalid exact selectors fail without fallback, including wrong owner/context.
+/// Default-first is deterministic, not a race heuristic or legacy physical-index adapter.
+[[nodiscard]] FailureOr<DropBarrierSelection>
+select_drop_barrier(const FaultBarrierInventory &inventory, const DropBarrierSelector &selector,
+                    FaultMutationError &error);
 
 enum class FaultQualification { Unverified, Validated };
 struct FaultMutationCapability {
@@ -104,7 +138,6 @@ struct DropBarrierResult {
   DropBarrierSelection selection;
   CheckedTextEditResult edit_result;
   uint32_t logical_mutation_count = 1;
-  FaultQualification transformation_validation = FaultQualification::Validated;
   FaultQualification execution_validation = FaultQualification::Unverified;
   FaultQualification detector_qualification = FaultQualification::Unverified;
   std::vector<std::string> assumptions;
@@ -126,16 +159,11 @@ fault_mutation_capabilities(const IsaTargetRegistry &registry = default_isa_targ
 discover_drop_barriers(const FaultMutationContext &context, std::string_view entry,
                        FaultMutationError &error);
 
-/// @brief Re-resolve a same-context selection and drop exactly one logical barrier.
+/// @brief Resolve an immutable same-context record and emit its complete members.
+/// @details Runtime checks input preconditions; recipe output semantics are tested,
+/// not reanalyzed by a production candidate validator.
 [[nodiscard]] FailureOr<DropBarrierResult> apply_drop_barrier(const FaultMutationContext &context,
                                                               const DropBarrierSelection &selection,
                                                               FaultMutationError &error);
-
-/// @brief Re-derive pristine members, decode candidate NOPs and inventory it afresh.
-/// @details Does not call the mutation emitter or accept its proof as authority.
-[[nodiscard]] Result validate_drop_barrier_candidate(const FaultMutationContext &context,
-                                                     const DropBarrierSelection &selection,
-                                                     std::span<const uint8_t> candidate,
-                                                     FaultMutationError &error);
 
 } // namespace rocjitsu

@@ -416,12 +416,15 @@ auto inventory = discover_drop_barriers(context, exact_entry_name, error);
 if (inventory.failed())
   return Result::failure(); // Report error.code and error.message to the caller.
 
-// Explicitly choose selected_barrier from inventory.value().barriers.
-const auto selection = inventory.value().select(selected_barrier);
-auto mutant = apply_drop_barrier(context, selection, error);
+// Default zero selects the first complete logical barrier in source order.
+// Supply .exact to override the ordinal without any fallback on exact failure.
+auto selection = select_drop_barrier(inventory.value(), {}, error);
+if (selection.failed())
+  return Result::failure();
+auto mutant = apply_drop_barrier(context, selection.value(), error);
 if (mutant.failed())
   return Result::failure();
-// mutant.value().edit_result.image contains the validated device ELF.
+// mutant.value().edit_result.image contains the emitted device ELF.
 ```
 
 The context owns an immutable copy of the source and supplies its target and
@@ -433,13 +436,29 @@ Decoding preserves the concrete target, including gfx1251 instruction features;
 it does not fall back to an architecture-default decoder. Capability listing
 uses the linked ISA registry and does not require simulator execution support.
 
-Apply rediscovers and matches the selected owner and complete ordered members,
-then replaces every member with a target NOP as one logical mutation. Other
-kernels, instructions, guest waits and metadata bytes remain unchanged. The
-independent validator checks exact changes and a fresh mutant inventory; it is
-also exposed as `validate_drop_barrier_candidate()`. Analysis is recomputed;
-this context does not cache a shared decoded program. Detailed contracts and
-typed failures are documented in the internal headers.
+The selector orders complete logical barriers by their original first-member
+text offset. An exact context-bound selector takes precedence over the zero-based
+ordinal, including when the ordinal is out of range. Invalid exact selectors never
+fall back. Default-first is a deterministic baseline, not a race heuristic; these
+logical ordinals are not compatible with prototype physical-site indices. The
+explicit legacy adapter belongs to FI21.
+
+The context builds all-entry direct CFG ownership and per-kernel qualification once.
+Inventories share immutable records; apply checks the private record and complete
+ordered members, then emits a target NOP for every member as one logical mutation.
+Full-text structural facts are cached separately because unreachable references
+are outside the ownership CFG. Instrumentor reuses its private full-section
+instruction/clause index through the same checked-edit machinery. No global
+cache or caller-supplied target/analysis override is involved.
+
+Runtime checks source/selection integrity, source format, ranges, references and
+replacement encoding before emission. Equal-length writes retain the existing
+CodeObjectPatcher layout contract. There is no production candidate validator or
+fresh mutant CFG pass. Recipe/emitter tests independently check NOP encodings,
+exact image deltas, remaining inventory, unselected kernels/guest waits and
+metadata, including corrupted-output controls. Parser validity alone would not
+prove correct Drop semantics; results do not claim per-artifact runtime semantic
+validation. Detailed input contracts and typed failures are in the internal headers.
 
 Partial or interleaved pairs, dynamic operands, named barrier lifecycle,
 `signal_isfirst`, clauses, cross-block pairs, shared helpers/calls, indirect
@@ -452,6 +471,6 @@ There is no selection of one dynamic occurrence or proof of convergence.
 Use the mutant as a new original image for a **fresh ConSan prepare** before
 execution/capture and analysis; pristine artifacts and capture bindings cannot
 be reused. Preparation may independently reject a profile the mutation library
-admits. Mutation success validates the transformation only. Execution and
+admits. Mutation success reports emission after input qualification. Execution and
 detector qualification remain unverified: removing a barrier does not establish
 that a race occurs, that a run observes it, or that ConSan detects it.

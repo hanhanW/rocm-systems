@@ -3,10 +3,12 @@
 
 #pragma once
 
+#include "rocjitsu/code/amdgpu_elf.h"
 #include "rocjitsu/code/rj_code.h"
 #include "rocjitsu/result.h"
 
 #include <cstdint>
+#include <memory>
 #include <span>
 #include <string>
 #include <vector>
@@ -68,30 +70,50 @@ struct CheckedTextEditResult {
   std::vector<TextEditMapping> mapping;
 };
 
-/// @brief Preflight every edit, then apply to a private CodeObjectPatcher image.
-/// @details Supports a single executable .text, complete 4/8/12-byte source
-/// instructions and complete replacement instructions. No layout or ELF metadata
-/// changes are allowed. Relocation writes into text and unsupported references,
-/// clause members, and symbol endpoints inside an edit are rejected. This proves
-/// section-level structural integrity only. PT_LOAD mapping, descriptor admission
-/// and the semantic delta are consumer obligations; success is not a loader or
-/// execution qualification. Section-only images may have no program headers.
-/// Other non-aliasing sections, including executable sections, remain byte-for-byte
-/// unchanged. This helper does not infer code ownership from section flags.
-/// The source object is the sole authority for target and section facts. Concrete
-/// bindings always select their concrete decoder. Legacy unbound ELF MACH values
-/// may select an existing non-variant family decoder through arch_for_elf_mach;
-/// unknown MACH values and unbound variant-aware families fail closed.
+/// @brief Reusable full-text structural facts tied to one immutable source object.
+/// @details Borrows the source, which must outlive this context and remain unchanged.
+/// It fixes concrete decoder features, the entire text range and linear clause/reference
+/// policy. It does not contain kernel roots or prove execution ownership. No caller can
+/// supply replacement source facts; Instrumentor alone can reuse its private full-text index.
+class CheckedTextEditContext {
+public:
+  static FailureOr<std::unique_ptr<CheckedTextEditContext>> create(const AmdGpuCodeObject &source,
+                                                                   TextEditError &error);
+  ~CheckedTextEditContext();
+  const TextSectionIdentity &section() const;
+  std::span<const Elf64_Shdr> section_headers() const;
+  CheckedTextEditContext(const CheckedTextEditContext &) = delete;
+  CheckedTextEditContext &operator=(const CheckedTextEditContext &) = delete;
+
+private:
+  class State;
+  explicit CheckedTextEditContext(const AmdGpuCodeObject &source);
+  Result initialize(const class InstructionBoundaries *boundaries, TextEditError &error);
+  static FailureOr<std::unique_ptr<CheckedTextEditContext>>
+  from_instructions(const AmdGpuCodeObject &source, const InstructionBoundaries &boundaries,
+                    TextEditError &error);
+  std::unique_ptr<State> state_;
+  friend class Instrumentor;
+  friend FailureOr<CheckedTextEditResult> apply_checked_text_edits(const CheckedTextEditContext &,
+                                                                   std::span<const CheckedTextEdit>,
+                                                                   TextEditError &);
+};
+
+/// @brief Preflight every request, then apply to a private CodeObjectPatcher image.
+/// @details Supports one executable .text and complete equal-length 4/8/12-byte edits.
+/// Checks source format, aliases, instruction extents, clauses, references, stale bytes
+/// and replacement encoding before writing. Other sections may be executable. Concrete
+/// bindings select concrete decoders; known legacy non-variant ELF architectures also work.
+/// Equal-length writes leave ELF layout unchanged under the patcher's existing contract.
+/// No post-emission expected-delta or recipe analysis runs here; emitter tests establish
+/// output semantics. PT_LOAD, descriptors and ownership remain consumer preconditions.
+[[nodiscard]] FailureOr<CheckedTextEditResult>
+apply_checked_text_edits(const CheckedTextEditContext &context,
+                         std::span<const CheckedTextEdit> edits, TextEditError &error);
+
+/// @brief One-shot convenience path; repeated edits should retain a checked context.
 [[nodiscard]] FailureOr<CheckedTextEditResult>
 apply_checked_text_edits(const AmdGpuCodeObject &source, std::span<const CheckedTextEdit> edits,
                          TextEditError &error);
-
-/// @brief Independently reparse a candidate and verify exact edits and unchanged bytes.
-/// @details Does not call the emitter. Also performs source preflight so an
-/// untrusted list of edits cannot authorize partial instructions or stale bytes.
-[[nodiscard]] Result validate_checked_text_candidate(const AmdGpuCodeObject &source,
-                                                     std::span<const CheckedTextEdit> edits,
-                                                     std::span<const uint8_t> candidate,
-                                                     TextEditError &error);
 
 } // namespace rocjitsu
