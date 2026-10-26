@@ -24,7 +24,7 @@ namespace {
 
 Result reject(TextEditError &error, TextEditErrorCode code, std::string message,
               uint64_t offset = 0) {
-  error = {code, offset, std::move(message)};
+  error = {.code = code, .offset = offset, .message = std::move(message)};
   return Result::failure();
 }
 
@@ -60,7 +60,7 @@ std::optional<SourceDecoder> create_source_decoder(const AmdGpuCodeObject &sourc
   }
   if (!descriptor || !decoder)
     return std::nullopt;
-  return SourceDecoder{descriptor->architecture_id, std::move(decoder)};
+  return SourceDecoder{.architecture = descriptor->architecture_id, .decoder = std::move(decoder)};
 }
 
 bool reference_enters_edit(uint64_t offset, std::span<const CheckedTextEdit> edits) {
@@ -144,14 +144,14 @@ Result CheckedTextEditContext::initialize(const InstructionBoundaries *boundarie
       text.size() > source.image_size() - text.sectionOffset())
     return reject(error, TextEditErrorCode::InvalidImage, "invalid .text extent");
   state_->isa = create_source_decoder(source);
-  auto &isa = state_->isa;
+  std::optional<SourceDecoder> &isa = state_->isa;
   if (!isa)
     return reject(error, TextEditErrorCode::UnsupportedTarget,
                   "source requires a concrete decoder or a known non-variant ELF architecture");
   Decoder &decoder = *isa->decoder;
   CodeObjectPatcher patcher(source);
   state_->sections = patcher.section_headers();
-  const auto &sections = state_->sections;
+  const std::vector<Elf64_Shdr> &sections = state_->sections;
   const auto aliases_text = [&](uint64_t offset, uint64_t size) {
     return size != 0 && offset < text.sectionOffset() + text.size() &&
            (offset >= text.sectionOffset() || size > text.sectionOffset() - offset);
@@ -180,7 +180,10 @@ Result CheckedTextEditContext::initialize(const InstructionBoundaries *boundarie
       patcher.has_rocr_rejected_none_relocation() || patcher.has_unsupported_relocation_to_text())
     return reject(error, TextEditErrorCode::UnsupportedReferences,
                   "unsupported relocation place or reference to .text");
-  state_->section = {*text.sectionHeaderIndex(), text.sectionOffset(), text.vaddr(), text.size()};
+  state_->section = {.index = *text.sectionHeaderIndex(),
+                     .file_offset = text.sectionOffset(),
+                     .vaddr = text.vaddr(),
+                     .size = text.size()};
   const std::span<const uint32_t> words(reinterpret_cast<const uint32_t *>(text.data()),
                                         text.size() / sizeof(uint32_t));
   size_t cursor = 0;
@@ -193,8 +196,9 @@ Result CheckedTextEditContext::initialize(const InstructionBoundaries *boundarie
     if (boundaries) {
       // Instrumentor's full-section graph supplies decoded facts. Prove coverage
       // including gaps; a reachable-only index must never stand in for this scan.
-      const auto entries = boundaries->entries();
-      const auto *entry = boundary_index < entries.size() ? &entries[boundary_index++] : nullptr;
+      const std::span<const InstructionBoundaries::Entry> entries = boundaries->entries();
+      const InstructionBoundaries::Entry *entry =
+          boundary_index < entries.size() ? &entries[boundary_index++] : nullptr;
       if (!entry || entry->offset != cursor * 4 || entry->size == 0 || entry->size % 4 != 0 ||
           entry->size / 4 > words.size() - cursor)
         return reject(error, TextEditErrorCode::InvalidInstruction,
@@ -202,7 +206,8 @@ Result CheckedTextEditContext::initialize(const InstructionBoundaries *boundarie
       cursor += entry->size / 4;
     } else {
       util::StringDiagnostic diagnostic;
-      auto decoded = decoder.decode_window(words.subspan(cursor), cursor * 4, diagnostic.emitter());
+      DecodeResult decoded =
+          decoder.decode_window(words.subspan(cursor), cursor * 4, diagnostic.emitter());
       if (decoded.failed())
         return reject(error, TextEditErrorCode::InvalidInstruction, diagnostic.message(),
                       cursor * 4);
@@ -246,7 +251,7 @@ FailureOr<CheckedTextEditResult> apply_checked_text_edits(const CheckedTextEditC
                                                           std::span<const CheckedTextEdit> edits,
                                                           TextEditError &error) {
   error = {};
-  const auto &state = *context.state_;
+  const CheckedTextEditContext::State &state = *context.state_;
   const AmdGpuCodeObject &source = state.source;
   const Section &text = *source.text_sections().front();
   std::vector<CheckedTextEdit> sorted(edits.begin(), edits.end());
@@ -276,7 +281,7 @@ FailureOr<CheckedTextEditResult> apply_checked_text_edits(const CheckedTextEditC
   }
 
   for (const CheckedTextEdit &edit : edits) {
-    const auto *instruction = state.boundaries->find(edit.offset);
+    const InstructionBoundaries::Entry *instruction = state.boundaries->find(edit.offset);
     if (!instruction || instruction->size != edit.expected.size())
       return reject(error, TextEditErrorCode::InvalidInstruction,
                     "edit does not cover one complete decoded source instruction", edit.offset);
@@ -300,17 +305,19 @@ FailureOr<CheckedTextEditResult> apply_checked_text_edits(const CheckedTextEditC
   for (const CheckedTextEdit &edit : sorted)
     std::memcpy(patcher.text_bytes().data() + edit.offset, edit.replacement.data(),
                 edit.replacement.size());
-  return CheckedTextEditResult{std::move(patcher).emit(),
-                               state.section,
-                               source.target_id(),
-                               std::move(sorted),
-                               {{0, 0, state.section.size}}};
+  return CheckedTextEditResult{
+      .image = std::move(patcher).emit(),
+      .section = state.section,
+      .target = source.target_id(),
+      .edits = std::move(sorted),
+      .mapping = {{.source_offset = 0, .candidate_offset = 0, .size = state.section.size}}};
 }
 
 FailureOr<CheckedTextEditResult> apply_checked_text_edits(const AmdGpuCodeObject &source,
                                                           std::span<const CheckedTextEdit> edits,
                                                           TextEditError &error) {
-  auto context = CheckedTextEditContext::create(source, error);
+  FailureOr<std::unique_ptr<CheckedTextEditContext>> context =
+      CheckedTextEditContext::create(source, error);
   if (context.failed())
     return Result::failure();
   return apply_checked_text_edits(*context.value(), edits, error);

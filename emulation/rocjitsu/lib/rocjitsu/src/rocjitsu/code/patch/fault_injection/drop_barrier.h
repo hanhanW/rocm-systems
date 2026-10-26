@@ -131,7 +131,9 @@ struct DropBarrierSelector {
 select_drop_barrier(const FaultBarrierInventory &inventory, const DropBarrierSelector &selector,
                     FaultMutationError &error);
 
+/// @brief Result evidence state, not an admission policy or target authority.
 enum class FaultQualification { Unverified, Validated };
+/// @brief Listing of registry-derived transformation admission, not a second policy registry.
 struct FaultMutationCapability {
   FaultMutationKind kind;
   StaticBarrierForm form;

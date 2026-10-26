@@ -6,19 +6,27 @@
 #include "rocjitsu/isa/instruction.h"
 
 #include <array>
+#include <cassert>
 #include <cstring>
 #include <optional>
 #include <utility>
 
 namespace rocjitsu {
 namespace {
+// SSRC inline-negative encodings start at 193 (-1), as named by the RDNA4
+// and CDNA5 OpSelSsrcBarrierId enums. Family policy bounds semantic IDs, not
+// encodings: sharing this first selector does not admit CDNA5's IDs on RDNA4.
+constexpr uint32_t kFirstInlineNegativeIntegerSelector = 193;
+constexpr int32_t kLowestWorkgroupBuiltinBarrierId = -2;
+
 Result reject(StaticBarrierError &error, StaticBarrierErrorCode code, uint64_t offset,
               std::string message) {
-  error = {code, offset, std::move(message)};
+  error = {.code = code, .offset = offset, .message = std::move(message)};
   return Result::failure();
 }
 StaticBarrierMember make_barrier_member(const Instruction &instruction) {
-  StaticBarrierMember result{instruction.src_loc(), std::vector<uint8_t>(instruction.size())};
+  StaticBarrierMember result{.offset = instruction.src_loc(),
+                             .bytes = std::vector<uint8_t>(instruction.size())};
   std::memcpy(result.bytes.data(), instruction.raw_encoding(), result.bytes.size());
   return result;
 }
@@ -34,12 +42,17 @@ std::optional<StaticBarrierPolicy> static_barrier_policy(rj_code_target_id_t tar
   static constexpr std::array<uint32_t, 1> wave64{64};
   switch (family->architecture_id) {
   case ROCJITSU_CODE_ARCH_RDNA4:
-    return StaticBarrierPolicy{StaticBarrierForm::BuiltinSplitPair, rdna_waves, -2};
+    return StaticBarrierPolicy{.form = StaticBarrierForm::BuiltinSplitPair,
+                               .wave_sizes = rdna_waves,
+                               .minimum_builtin_id = kLowestWorkgroupBuiltinBarrierId};
   case ROCJITSU_CODE_ARCH_CDNA5:
-    return StaticBarrierPolicy{StaticBarrierForm::BuiltinSplitPair, wave32, -4};
+    return StaticBarrierPolicy{.form = StaticBarrierForm::BuiltinSplitPair,
+                               .wave_sizes = wave32,
+                               .minimum_builtin_id = -4};
   case ROCJITSU_CODE_ARCH_CDNA3:
   case ROCJITSU_CODE_ARCH_CDNA4:
-    return StaticBarrierPolicy{StaticBarrierForm::FullSingleton, wave64, -1};
+    return StaticBarrierPolicy{
+        .form = StaticBarrierForm::FullSingleton, .wave_sizes = wave64, .minimum_builtin_id = -1};
   default:
     return std::nullopt;
   }
@@ -56,6 +69,7 @@ FailureOr<std::vector<StaticBarrier>> qualify_static_barriers(std::span<BasicBlo
   std::vector<StaticBarrier> barriers;
   uint32_t clause_remaining = 0;
   for (BasicBlock *block : blocks) {
+    // Pairing must stop at a block boundary, even when the next block is adjacent.
     std::optional<StaticBarrier> pending;
     for (const Instruction &instruction : block->instructions()) {
       const std::string_view name = instruction.mnemonic();
@@ -64,6 +78,9 @@ FailureOr<std::vector<StaticBarrier>> qualify_static_barriers(std::span<BasicBlo
         --clause_remaining;
       if (name == "s_clause")
         clause_remaining = (instruction.raw_encoding()[0] & 0x3fu) + 1u;
+      // BARRIER is a coarse flag: decoded init/join currently omit it. Keep the
+      // canonical-name guard so unsupported lifecycle/state forms cannot silently
+      // pass as ordinary instructions; exact form checks below decide admission.
       if (name.find("barrier") == std::string_view::npos && !instruction.is_barrier())
         continue;
       const uint64_t offset = instruction.src_loc();
@@ -74,11 +91,11 @@ FailureOr<std::vector<StaticBarrier>> qualify_static_barriers(std::span<BasicBlo
         if (name != "s_barrier")
           return reject(error, StaticBarrierErrorCode::UnsupportedForm, offset,
                         "only full s_barrier is qualified for this family");
-        barriers.push_back({StaticBarrierForm::FullSingleton,
-                            block->start_offset(),
-                            -1,
-                            StaticBarrierScope::Workgroup,
-                            {make_barrier_member(instruction)}});
+        barriers.push_back({.form = StaticBarrierForm::FullSingleton,
+                            .block_offset = block->start_offset(),
+                            .barrier_id = -1,
+                            .scope = StaticBarrierScope::Workgroup,
+                            .members = {make_barrier_member(instruction)}});
         continue;
       }
       if (name != "s_barrier_signal" && name != "s_barrier_wait")
@@ -87,24 +104,31 @@ FailureOr<std::vector<StaticBarrier>> qualify_static_barriers(std::span<BasicBlo
       const uint32_t word = instruction.raw_encoding()[0];
       if (name == "s_barrier_signal") {
         const uint32_t selector = word & 0xffu;
-        if (selector < 193 || selector > 192u + static_cast<uint32_t>(-policy->minimum_builtin_id))
+        const uint32_t last_selector = kFirstInlineNegativeIntegerSelector +
+                                       static_cast<uint32_t>(-policy->minimum_builtin_id) - 1;
+        if (selector < kFirstInlineNegativeIntegerSelector || selector > last_selector)
           return reject(error, StaticBarrierErrorCode::UnsupportedForm, offset,
                         "named, dynamic and literal barrier operands are outside this profile");
         if (pending)
           return reject(error, StaticBarrierErrorCode::IncompleteBarrier, offset,
                         "interleaved or repeated signal before completing wait");
-        const int32_t id = -static_cast<int32_t>(selector - 192);
-        pending =
-            StaticBarrier{StaticBarrierForm::BuiltinSplitPair,
-                          block->start_offset(),
-                          id,
-                          id >= -2 ? StaticBarrierScope::Workgroup : StaticBarrierScope::Cluster,
-                          {make_barrier_member(instruction)}};
+        const int32_t id =
+            -static_cast<int32_t>(selector - kFirstInlineNegativeIntegerSelector + 1);
+        pending = StaticBarrier{.form = StaticBarrierForm::BuiltinSplitPair,
+                                .block_offset = block->start_offset(),
+                                .barrier_id = id,
+                                .scope = id >= kLowestWorkgroupBuiltinBarrierId
+                                             ? StaticBarrierScope::Workgroup
+                                             : StaticBarrierScope::Cluster,
+                                .members = {make_barrier_member(instruction)}};
       } else {
         const int32_t id = static_cast<int16_t>(word & 0xffffu);
         if (!pending || pending->barrier_id != id)
           return reject(error, StaticBarrierErrorCode::IncompleteBarrier, offset,
                         "wait has no matching same-block signal");
+        // Only the admitted signal above creates pending; input mismatches have
+        // already returned a diagnostic. Its single member is an internal invariant.
+        assert(pending->members.size() == 1);
         pending->members.push_back(make_barrier_member(instruction));
         barriers.push_back(std::move(*pending));
         pending.reset();

@@ -809,12 +809,12 @@ TEST_P(InstrumentorSourceTarget, OrdinaryPatchPreservesIdentityAndGuestReturn) {
   const SourceTargetRow &row = GetParam();
   const uint32_t nop = build_s_nop(0, row.arch);
   const uint32_t end = build_s_endpgm(row.arch);
-  const auto image = make_amdgpu_kernel_elf({nop, end}, 0, 3, row.machine);
+  const std::vector<uint8_t> image = make_amdgpu_kernel_elf({nop, end}, 0, 3, row.machine);
   const AmdGpuCodeObject source(image.data(), image.size());
   ASSERT_TRUE(source.is_valid());
   Instrumentor instrumentor(source, row.arch);
   instrumentor.add_point_by_offset(0);
-  const auto result = instrumentor.patch_with_debug_summaries();
+  const InstrumentedCodeObjectDebug result = instrumentor.patch_with_debug_summaries();
   ASSERT_TRUE(result.errors.empty()) << result.errors.front();
   ASSERT_EQ(result.patches.size(), 1u);
   ASSERT_EQ(result.sites.size(), 1u);
@@ -825,20 +825,20 @@ TEST_P(InstrumentorSourceTarget, OrdinaryPatchPreservesIdentityAndGuestReturn) {
   std::memcpy(&before, image.data(), sizeof(before));
   std::memcpy(&after, result.elf_bytes.data(), sizeof(after));
   EXPECT_EQ(after.e_flags, before.e_flags);
-  const auto words = section_words(candidate, ".text");
+  const std::vector<uint32_t> words = section_words(candidate, ".text");
   ASSERT_GT(words.size(), 2u);
   EXPECT_EQ(words[1], end);
-  const auto &patch = result.patches.front();
+  const InstrumentationPatch &patch = result.patches.front();
   const uint64_t guest = result.sites.front().guest_offset;
-  const auto forward = compute_sopp_branch_simm16(0, patch.trampoline_offset);
-  const auto back = compute_sopp_branch_simm16(guest + 4, 4);
+  const std::optional<int16_t> forward = compute_sopp_branch_simm16(0, patch.trampoline_offset);
+  const std::optional<int16_t> back = compute_sopp_branch_simm16(guest + 4, 4);
   ASSERT_TRUE(forward);
   ASSERT_TRUE(back);
   EXPECT_EQ(words[0], build_s_branch(*forward, row.arch));
   EXPECT_EQ(words.at(guest / 4), nop);
   EXPECT_EQ(words.at(guest / 4 + 1), build_s_branch(*back, row.arch));
   EXPECT_EQ(patch.return_target, 4u);
-  const auto entry = patched_entry_text_offset(candidate);
+  const std::optional<uint64_t> entry = patched_entry_text_offset(candidate);
   ASSERT_TRUE(entry);
   EXPECT_EQ(*entry, 0u);
 }
@@ -864,8 +864,8 @@ INSTANTIATE_TEST_SUITE_P(
 
 TEST(InstrumentorPatch, PreservesAdditionalExecutableSectionAndDescriptorMapping) {
   constexpr rj_code_arch_t arch = ROCJITSU_CODE_ARCH_CDNA4;
-  auto image = make_amdgpu_kernel_elf({build_s_nop(0, arch), build_s_endpgm(arch)}, 0, 3,
-                                      EF_AMDGPU_MACH_AMDGCN_GFX950);
+  std::vector<uint8_t> image = make_amdgpu_kernel_elf({build_s_nop(0, arch), build_s_endpgm(arch)},
+                                                      0, 3, EF_AMDGPU_MACH_AMDGCN_GFX950);
   Elf64_Ehdr header{};
   std::memcpy(&header, image.data(), sizeof(header));
   Elf64_Shdr rodata{};
@@ -878,7 +878,7 @@ TEST(InstrumentorPatch, PreservesAdditionalExecutableSectionAndDescriptorMapping
   ASSERT_EQ(source.allocated_executable_sections().size(), 2u);
   Instrumentor instrumentor(source, arch);
   instrumentor.add_point_by_offset(0);
-  const auto result = instrumentor.patch();
+  const InstrumentedCodeObject result = instrumentor.patch();
   ASSERT_TRUE(result.errors.empty()) << result.errors.front();
   const AmdGpuCodeObject candidate(result.elf_bytes.data(), result.elf_bytes.size());
   ASSERT_TRUE(candidate.is_valid());
@@ -897,26 +897,26 @@ TEST(InstrumentorPatch, PreservesAdditionalExecutableSectionAndDescriptorMapping
   std::memcpy(expected.data(), &descriptor, sizeof(descriptor));
   EXPECT_TRUE(
       std::equal(expected.begin(), expected.end(), result.elf_bytes.begin() + after.sh_offset));
-  const auto entry = patched_entry_text_offset(candidate);
+  const std::optional<uint64_t> entry = patched_entry_text_offset(candidate);
   ASSERT_TRUE(entry);
   EXPECT_EQ(*entry, 0u);
-  const auto words = section_words(candidate, ".text");
+  const std::vector<uint32_t> words = section_words(candidate, ".text");
   EXPECT_EQ(words.at(0), build_s_branch(1, arch));
   EXPECT_EQ(words.at(1), build_s_endpgm(arch));
 }
 
 TEST(InstrumentorPatch, RejectsLegacySourceArchitectureOverride) {
-  const auto image = make_amdgpu_kernel_elf(
+  const std::vector<uint8_t> image = make_amdgpu_kernel_elf(
       {build_s_nop(0, ROCJITSU_CODE_ARCH_CDNA1), build_s_endpgm(ROCJITSU_CODE_ARCH_CDNA1)}, 0, 3,
       EF_AMDGPU_MACH_AMDGCN_GFX908);
   const AmdGpuCodeObject source(image.data(), image.size());
   Instrumentor instrumentor(source, ROCJITSU_CODE_ARCH_CDNA4);
   instrumentor.add_point_by_offset(0);
-  const auto resolved = instrumentor.validate_points();
+  const Instrumentor::ValidationResult resolved = instrumentor.validate_points();
   EXPECT_TRUE(resolved.sites.empty());
   ASSERT_FALSE(resolved.errors.empty());
   EXPECT_NE(resolved.errors.front().find("ELF architecture does not match"), std::string::npos);
-  const auto result = instrumentor.patch();
+  const InstrumentedCodeObject result = instrumentor.patch();
   EXPECT_FALSE(result.errors.empty());
   EXPECT_TRUE(result.elf_bytes.empty());
 }
@@ -4478,7 +4478,7 @@ TEST(InstrumentorKernelBoundary, EntryStubComposesWithCheckedOrdinaryAndExitEdit
   ASSERT_GE(words.size(), 5u);
   EXPECT_TRUE(
       std::equal(kGfx12GlobalStoreV0V1S2.begin(), kGfx12GlobalStoreV0V1S2.end(), words.begin()));
-  const auto entry = patched_entry_text_offset(patched);
+  const std::optional<uint64_t> entry = patched_entry_text_offset(patched);
   ASSERT_TRUE(entry);
   const auto target_of = [&](uint64_t offset) {
     return offset + 4 + int64_t{static_cast<int16_t>(words.at(offset / 4))} * 4;

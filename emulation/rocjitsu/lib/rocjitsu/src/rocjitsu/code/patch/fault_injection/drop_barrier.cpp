@@ -13,6 +13,8 @@
 #include "rocjitsu/isa/target_registry.h"
 
 #include <algorithm>
+#include <cassert>
+#include <cstddef>
 #include <cstring>
 #include <memory>
 #include <mutex>
@@ -25,20 +27,23 @@ namespace {
 
 Result reject(FaultMutationError &error, FaultMutationErrorCode code, std::string message,
               uint64_t offset = 0) {
-  error = {code, offset, std::move(message)};
+  error = {.code = code, .offset = offset, .message = std::move(message)};
   return Result::failure();
 }
 
 FaultMutationError translate_edit_error(const TextEditError &edit) {
   if (edit.code == TextEditErrorCode::UnsupportedTarget)
-    return {FaultMutationErrorCode::UnsupportedTarget, edit.offset, edit.message};
+    return {.code = FaultMutationErrorCode::UnsupportedTarget,
+            .offset = edit.offset,
+            .message = edit.message};
   const bool unsupported = edit.code == TextEditErrorCode::UnsupportedReferences ||
                            edit.code == TextEditErrorCode::Clause ||
                            edit.code == TextEditErrorCode::InvalidInstruction ||
                            edit.code == TextEditErrorCode::InvalidImage;
-  return {unsupported ? FaultMutationErrorCode::UnsupportedForm
-                      : FaultMutationErrorCode::ValidationFailure,
-          edit.offset, edit.message};
+  return {.code = unsupported ? FaultMutationErrorCode::UnsupportedForm
+                              : FaultMutationErrorCode::ValidationFailure,
+          .offset = edit.offset,
+          .message = edit.message};
 }
 
 // Called only after AmdGpuCodeObject validates segment extents and VA arithmetic.
@@ -109,7 +114,7 @@ bool DropBarrierSelection::belongs_to(const FaultMutationContext &context) const
 Result DropBarrierSelection::resolve(FaultMutationError &error) const {
   if (kind != FaultMutationKind::DropBarrier)
     return reject(error, FaultMutationErrorCode::InvalidParameters, "unknown mutation kind");
-  const auto record = record_.lock();
+  const std::shared_ptr<const FaultBarrierRecord> record = record_.lock();
   if (source_.expired() || !record)
     return reject(error, FaultMutationErrorCode::BadIdentity, "expired or unbound selection");
   if (owner != record->owner || ordinal_ >= record->barriers.size() ||
@@ -127,12 +132,15 @@ FailureOr<DropBarrierSelection> select_drop_barrier(const FaultBarrierInventory 
                                                     const DropBarrierSelector &selector,
                                                     FaultMutationError &error) {
   error = {};
-  const auto &record = inventory.record_;
+  const std::shared_ptr<const FaultBarrierRecord> &record = inventory.record_;
   if (!record || record->source.expired())
     return reject(error, FaultMutationErrorCode::BadIdentity, "expired or unbound inventory");
   // clang-format off
   // TODO(hanchung): Add a better barrier-selection heuristic while preserving explicit selection and reproducibility.
   // clang-format on
+  // Currently, an exact selection takes precedence; otherwise we use the requested
+  // zero-based logical ordinal in first-member source order, defaulting to zero.
+  // Repeated default requests choose the same barrier; no race scoring is used.
   if (selector.exact) {
     if (selector.exact->record_.lock() != record)
       return reject(error, FaultMutationErrorCode::BadIdentity,
@@ -166,18 +174,23 @@ fault_mutation_capabilities(const IsaTargetRegistry &registry) {
         continue;
       for (const uint32_t wave : policy->wave_sizes)
         capabilities.push_back(
-            {FaultMutationKind::DropBarrier, policy->form, family.architecture_id,
-             binding.public_id, wave,
-             "code-object-v5; file-backed text/descriptors; exact kernel; "
-             "independent siblings; closed direct CFG; complete builtin barrier"});
+            {.kind = FaultMutationKind::DropBarrier,
+             .form = policy->form,
+             .architecture = family.architecture_id,
+             .target = binding.public_id,
+             .wave_size = wave,
+             .admission = "code-object-v5; file-backed text/descriptors; exact kernel; "
+                          "independent siblings; closed direct CFG; complete builtin barrier"});
     }
   }
   return capabilities;
 }
 
 Result FaultMutationContext::analyze() const {
+  // Admit one immutable image and its source-derived concrete target. Family
+  // policy limits mutation forms; it must not substitute an architecture decoder.
   FaultMutationError &error = state_->error;
-  const auto image = this->image();
+  const std::span<const uint8_t> image = this->image();
   const AmdGpuCodeObject &object = source();
   const rj_code_target_id_t target = object.target_id();
   Elf64_Ehdr header{};
@@ -208,21 +221,23 @@ Result FaultMutationContext::analyze() const {
   if ((text.flags() & (SHF_ALLOC | SHF_EXECINSTR)) != (SHF_ALLOC | SHF_EXECINSTR))
     return reject(error, FaultMutationErrorCode::UnsupportedForm,
                   "selected .text must be allocated and executable");
+  // Establish load correspondence for every hardware entry, including siblings.
+  // Section-relative descriptor facts alone do not prove a loader uses those bytes.
   const std::vector<KernelDescriptorInfo> kernels =
       scan_kernel_descriptors(image, text.sectionOffset(), text.size(), text.sectionHeaderIndex());
-  const auto segments =
+  const std::optional<std::vector<Elf64_Phdr>> segments =
       read_elf_table<Elf64_Phdr>(image, header.e_phoff, header.e_phnum, header.e_phentsize);
   if (!segments)
     return reject(error, FaultMutationErrorCode::UnsupportedForm, "invalid program headers");
-  const auto text_address =
+  const std::optional<uint64_t> text_address =
       resolve_file_backed_address(*segments, text.sectionOffset(), text.size(), PF_X);
   if (!text_address || *text_address != text.vaddr())
     return reject(error, FaultMutationErrorCode::UnsupportedForm,
                   "requires unambiguous file-backed executable .text at its declared address");
   for (const KernelDescriptorInfo &owner : kernels) {
-    const auto descriptor_address = resolve_file_backed_address(
+    const std::optional<uint64_t> descriptor_address = resolve_file_backed_address(
         *segments, owner.descriptor_file_offset, sizeof(owner.descriptor), 0);
-    const auto loaded_entry =
+    const std::optional<uint64_t> loaded_entry =
         descriptor_address
             ? add_signed_offset(*descriptor_address, owner.descriptor.kernel_code_entry_byte_offset)
             : std::nullopt;
@@ -235,14 +250,18 @@ Result FaultMutationContext::analyze() const {
                     "firmware preload ownership requires additional entry analysis");
   }
 
+  // Full-text structural facts cover even unreachable references. Independently
+  // reconcile declared owners: a descriptor omitted by the scanner is unresolved,
+  // not evidence that the owner does not exist.
   TextEditError edit_error;
-  auto structural = CheckedTextEditContext::create(object, edit_error);
+  FailureOr<std::unique_ptr<CheckedTextEditContext>> structural =
+      CheckedTextEditContext::create(object, edit_error);
   if (structural.failed()) {
     error = translate_edit_error(edit_error);
     return Result::failure();
   }
   state_->edits = std::move(structural).value();
-  const auto sections = state_->edits->section_headers();
+  const std::span<const Elf64_Shdr> sections = state_->edits->section_headers();
   for (const Elf64_Shdr &section : sections) {
     if (section.sh_type != SHT_SYMTAB && section.sh_type != SHT_DYNSYM)
       continue;
@@ -309,32 +328,39 @@ Result FaultMutationContext::analyze() const {
                       "separate function/data owners inside .text are outside this profile");
     }
   }
-  auto decoder = Decoder::create(registry, target);
+  // Build Reachable / ExplicitOnly CFG facts from all descriptor entries. Starting
+  // only at the selected entry would hide cross-kernel or shared-block ownership;
+  // these reachability facts cannot replace the full-text structural scan above.
+  std::unique_ptr<Decoder> decoder = Decoder::create(registry, target);
   if (!decoder)
     return reject(error, FaultMutationErrorCode::UnsupportedTarget,
                   "concrete target decoder unavailable");
   std::vector<uint64_t> entries;
   std::unordered_set<uint64_t> all_entries;
-  for (const auto &owner : kernels) {
+  for (const KernelDescriptorInfo &owner : kernels) {
     if (!all_entries.insert(owner.entry_text_offset).second)
       return reject(error, FaultMutationErrorCode::AmbiguousSelection,
                     "kernel descriptors alias one hardware entry");
     entries.push_back(owner.entry_text_offset);
   }
   util::StringDiagnostic diagnostic;
-  auto blocks = BasicBlock::build_reachable(object, *decoder, target_facts->architecture_id,
-                                            entries, diagnostic.emitter(), {}, {}, {}, target);
+  FailureOr<std::vector<std::unique_ptr<BasicBlock>>> blocks =
+      BasicBlock::build_reachable(object, *decoder, target_facts->architecture_id, entries,
+                                  diagnostic.emitter(), {}, {}, {}, target);
   if (blocks.failed())
     return reject(error, FaultMutationErrorCode::UnsupportedForm, diagnostic.message());
   const BlockOffsetIndex index = build_block_offset_index(blocks.value());
   const BlockPositionIndex positions = build_block_position_index(blocks.value());
   std::unordered_map<const BasicBlock *, uint64_t> block_owners;
-  for (const auto &owner : kernels) {
+  for (const KernelDescriptorInfo &owner : kernels) {
     BasicBlock *root = block_for_offset(index, owner.entry_text_offset);
     if (!root || root->start_offset() != owner.entry_text_offset)
       return reject(error, FaultMutationErrorCode::UnsupportedForm, "entry is not a block start");
-    const KernelScopeSpec spec{all_entries, {owner.entry_text_offset}, {}};
-    auto scope = reachable_kernel_blocks(blocks.value(), index, positions, *root, spec);
+    const KernelScopeSpec scope_spec{.kernel_entries = all_entries,
+                                     .own_entries = {owner.entry_text_offset},
+                                     .address_taken_entries = {}};
+    std::vector<BasicBlock *> scope =
+        reachable_kernel_blocks(blocks.value(), index, positions, *root, scope_spec);
     for (BasicBlock *block : scope) {
       const auto [position, inserted] = block_owners.emplace(block, owner.entry_text_offset);
       if (!inserted && position->second != owner.entry_text_offset)
@@ -358,25 +384,33 @@ Result FaultMutationContext::analyze() const {
                         "indirect owner is unsupported", instruction.src_loc());
       }
     }
+    // Ownership failures reject the whole profile. Once this scope is exclusive,
+    // cache its wave/form error or qualified barriers in an immutable record so
+    // an unsupported sibling barrier does not disqualify an independent kernel.
     auto record = std::make_shared<FaultBarrierRecord>();
     record->section = state_->edits->section();
-    record->owner = {owner.kernel_name, owner.entry_text_offset, owner.descriptor_file_offset};
+    record->owner = {.entry = owner.kernel_name,
+                     .entry_offset = owner.entry_text_offset,
+                     .descriptor_file_offset = owner.descriptor_file_offset};
     record->source = source_;
     const uint32_t wave = kernel_wavefront_size(target_facts->architecture_id, owner.descriptor);
     if (std::ranges::find(policy->wave_sizes, wave) == policy->wave_sizes.end() ||
         (policy->form == StaticBarrierForm::FullSingleton &&
          (owner.descriptor.kernel_code_properties &
           amdhsa::KERNEL_CODE_PROPERTY_ENABLE_WAVEFRONT_SIZE32) != 0)) {
-      record->error = {FaultMutationErrorCode::UnsupportedForm, 0,
-                       "descriptor wave mode is not admitted by this barrier family"};
+      record->error = {.code = FaultMutationErrorCode::UnsupportedForm,
+                       .offset = 0,
+                       .message = "descriptor wave mode is not admitted by this barrier family"};
     } else {
       StaticBarrierError barrier_error;
-      auto barriers = qualify_static_barriers(scope, target, barrier_error);
+      FailureOr<std::vector<StaticBarrier>> barriers =
+          qualify_static_barriers(scope, target, barrier_error);
       if (barriers.failed()) {
-        record->error = {barrier_error.code == StaticBarrierErrorCode::IncompleteBarrier
-                             ? FaultMutationErrorCode::IncompleteSelection
-                             : FaultMutationErrorCode::UnsupportedForm,
-                         barrier_error.offset, barrier_error.message};
+        record->error = {.code = barrier_error.code == StaticBarrierErrorCode::IncompleteBarrier
+                                     ? FaultMutationErrorCode::IncompleteSelection
+                                     : FaultMutationErrorCode::UnsupportedForm,
+                         .offset = barrier_error.offset,
+                         .message = barrier_error.message};
       } else {
         record->barriers = std::move(barriers).value();
         std::ranges::sort(record->barriers, {}, [](const StaticBarrier &barrier) {
@@ -401,17 +435,23 @@ FailureOr<FaultBarrierInventory> discover_drop_barriers(const FaultMutationConte
     error = context.state_->error;
     return Result::failure();
   }
-  const auto &kernels = context.state_->kernels;
-  const auto matches = std::ranges::count_if(
-      kernels, [&](const auto &record) { return record->owner.entry == entry; });
+  // First choose one exact kernel record; ambiguous names never select the first.
+  // Logical-barrier ordering and exact-handle precedence apply within that record.
+  const std::vector<std::shared_ptr<const FaultBarrierRecord>> &kernels = context.state_->kernels;
+  const std::ptrdiff_t matches =
+      std::ranges::count_if(kernels, [&](const std::shared_ptr<const FaultBarrierRecord> &record) {
+        return record->owner.entry == entry;
+      });
   if (matches > 1)
     return reject(error, FaultMutationErrorCode::AmbiguousSelection,
                   "exact entry name identifies multiple descriptors");
   if (entry.empty() || matches == 0)
     return reject(error, FaultMutationErrorCode::BadIdentity,
                   "entry must match one exact kernel name");
-  const auto record = *std::ranges::find_if(
-      kernels, [&](const auto &candidate) { return candidate->owner.entry == entry; });
+  const std::shared_ptr<const FaultBarrierRecord> record = *std::ranges::find_if(
+      kernels, [&](const std::shared_ptr<const FaultBarrierRecord> &candidate) {
+        return candidate->owner.entry == entry;
+      });
   if (record->error.code != FaultMutationErrorCode::None) {
     error = record->error;
     return Result::failure();
@@ -430,18 +470,28 @@ FailureOr<DropBarrierResult> apply_drop_barrier(const FaultMutationContext &cont
                   "selection belongs to another or expired source context");
   if (selection.resolve(error).failed())
     return Result::failure();
-  const auto record = selection.record_.lock();
+  const std::shared_ptr<const FaultBarrierRecord> record = selection.record_.lock();
+  // resolve checked the private ordinal and public facts; the matching live
+  // context retains this immutable record throughout apply.
+  assert(record && selection.ordinal_ < record->barriers.size());
   const StaticBarrier &barrier = record->barriers[selection.ordinal_];
   std::vector<CheckedTextEdit> edits;
-  const auto *target = default_isa_target_registry().find(context.source().target_id());
+  const IsaTargetDescriptor *target =
+      default_isa_target_registry().find(context.source().target_id());
+  // Only successful analyze/discover can produce a bound selection. That path
+  // admits the immutable source target and initializes the checked edit facts.
+  assert(target && context.state_->edits);
   const uint32_t nop = build_s_nop(0, target->architecture_id);
   for (const StaticBarrierMember &member : barrier.members) {
-    CheckedTextEdit edit{member.offset, member.bytes, std::vector<uint8_t>(member.bytes.size())};
+    CheckedTextEdit edit{.offset = member.offset,
+                         .expected = member.bytes,
+                         .replacement = std::vector<uint8_t>(member.bytes.size())};
     std::memcpy(edit.replacement.data(), &nop, sizeof(nop));
     edits.push_back(std::move(edit));
   }
   TextEditError edit_error;
-  auto applied = apply_checked_text_edits(*context.state_->edits, edits, edit_error);
+  FailureOr<CheckedTextEditResult> applied =
+      apply_checked_text_edits(*context.state_->edits, edits, edit_error);
   if (applied.failed()) {
     error = translate_edit_error(edit_error);
     return Result::failure();

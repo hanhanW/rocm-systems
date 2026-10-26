@@ -413,17 +413,17 @@ selections. Each request below produces an independent mutant of the same origin
 ```cpp
 FaultMutationError error;
 const FaultMutationContext context(image); // Retain for this input's whole session.
-auto inventory = discover_drop_barriers(context, exact_entry_name, error);
+FailureOr<FaultBarrierInventory> inventory = discover_drop_barriers(context, exact_entry_name, error);
 if (inventory.failed())
   return Result::failure(); // Report error.code and error.message to the caller.
 
 // The caller supplies requested_selections. A default-initialized selector uses
 // logical ordinal zero; .exact overrides the ordinal without fallback on failure.
 for (const DropBarrierSelector &request : requested_selections) {
-  auto selection = select_drop_barrier(inventory.value(), request, error);
+  FailureOr<DropBarrierSelection> selection = select_drop_barrier(inventory.value(), request, error);
   if (selection.failed())
     return Result::failure();
-  auto mutant = apply_drop_barrier(context, selection.value(), error);
+  FailureOr<DropBarrierResult> mutant = apply_drop_barrier(context, selection.value(), error);
   if (mutant.failed())
     return Result::failure();
   // Consume or retain mutant.value().edit_result.image for this request.

@@ -44,6 +44,10 @@ struct StaticBarrier {
 };
 
 /// @brief Bounded mutation policy for a registry-bound ISA family.
+/// @details Supplies form, admitted wave sizes and the lowest semantic builtin ID.
+/// Split forms use -1/-2 for workgroup scope; CDNA5 also admits -3/-4 for cluster
+/// scope. Full singleton barriers have logical ID -1 without a split selector.
+/// This is not CFG ownership, a selection heuristic or an execution qualification.
 struct StaticBarrierPolicy {
   StaticBarrierForm form;
   std::span<const uint32_t> wave_sizes;

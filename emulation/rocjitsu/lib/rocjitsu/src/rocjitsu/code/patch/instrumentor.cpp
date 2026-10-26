@@ -1114,7 +1114,7 @@ Instrumentor::ResolvedPoints Instrumentor::resolve_points() {
       continue;
     }
 
-    const auto *boundary = instruction_boundaries_.find(pt.anchor_offset);
+    const InstructionBoundaries::Entry *boundary = instruction_boundaries_.find(pt.anchor_offset);
     if (boundary && boundary->clause_member) {
       out.errors.emplace_back("anchor is inside an s_clause run, anchor_offset = " +
                               std::to_string(pt.anchor_offset));
@@ -1714,10 +1714,11 @@ InstrumentedCodeObjectDebug Instrumentor::patch_with_debug_summaries() {
       }
       entry_patch->words.back() = build_s_branch(*target, arch_);
     } else {
-      anchor_edits.push_back({a.site->anchor_offset,
-                              a.site->original_bytes,
-                              {a.bytes.patched_anchor_bytes.begin(),
-                               a.bytes.patched_anchor_bytes.begin() + a.site->original_size}});
+      anchor_edits.push_back(
+          {.offset = a.site->anchor_offset,
+           .expected = a.site->original_bytes,
+           .replacement = {a.bytes.patched_anchor_bytes.begin(),
+                           a.bytes.patched_anchor_bytes.begin() + a.site->original_size}});
     }
   }
   // Entry-only callbacks patch the appended stub, leaving original text intact.
@@ -1728,7 +1729,7 @@ InstrumentedCodeObjectDebug Instrumentor::patch_with_debug_summaries() {
   } else {
     TextEditError edit_error;
     if (!text_edits_) {
-      auto facts =
+      FailureOr<std::unique_ptr<CheckedTextEditContext>> facts =
           CheckedTextEditContext::from_instructions(obj_, instruction_boundaries_, edit_error);
       if (facts.failed()) {
         result.errors.emplace_back("anchor edit transaction: " + edit_error.message);
