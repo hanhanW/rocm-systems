@@ -407,25 +407,35 @@ Non-barrier instructions may separate a split pair's members in one block.
 A `StaticBarrier` records its form and ordered members: two for a split pair,
 one for a true full barrier. A half-pair cannot become a singleton. This is
 distinct from GPU workgroup scope and FI22's group of two logical barriers.
-Select one complete barrier explicitly from the inventory:
+Keep one context in the input/session owner and reuse it for the requested
+selections. Each request below produces an independent mutant of the same original:
 
 ```cpp
 FaultMutationError error;
-const FaultMutationContext context(image);
+const FaultMutationContext context(image); // Retain for this input's whole session.
 auto inventory = discover_drop_barriers(context, exact_entry_name, error);
 if (inventory.failed())
   return Result::failure(); // Report error.code and error.message to the caller.
 
-// Default zero selects the first complete logical barrier in source order.
-// Supply .exact to override the ordinal without any fallback on exact failure.
-auto selection = select_drop_barrier(inventory.value(), {}, error);
-if (selection.failed())
-  return Result::failure();
-auto mutant = apply_drop_barrier(context, selection.value(), error);
-if (mutant.failed())
-  return Result::failure();
-// mutant.value().edit_result.image contains the emitted device ELF.
+// The caller supplies requested_selections. A default-initialized selector uses
+// logical ordinal zero; .exact overrides the ordinal without fallback on failure.
+for (const DropBarrierSelector &request : requested_selections) {
+  auto selection = select_drop_barrier(inventory.value(), request, error);
+  if (selection.failed())
+    return Result::failure();
+  auto mutant = apply_drop_barrier(context, selection.value(), error);
+  if (mutant.failed())
+    return Result::failure();
+  // Consume or retain mutant.value().edit_result.image for this request.
+}
 ```
+
+For a single-input CLI, the context can live for the entire process. A runner
+handling several images should retain a separate context per image until its
+related operations finish; this is not a process-global context. Further kernel
+discovery on the same context reuses its source facts. To analyze or mutate an
+emitted mutant, create a new context from its bytes and obtain new selections;
+do not replace the pristine context's source or reuse its facts for changed bytes.
 
 The context owns an immutable copy of the source and supplies its target and
 architecture. A selection is bound to that context's lifetime; another context,

@@ -17,7 +17,7 @@ Result reject(StaticBarrierError &error, StaticBarrierErrorCode code, uint64_t o
   error = {code, offset, std::move(message)};
   return Result::failure();
 }
-StaticBarrierMember member(const Instruction &instruction) {
+StaticBarrierMember make_barrier_member(const Instruction &instruction) {
   StaticBarrierMember result{instruction.src_loc(), std::vector<uint8_t>(instruction.size())};
   std::memcpy(result.bytes.data(), instruction.raw_encoding(), result.bytes.size());
   return result;
@@ -78,7 +78,7 @@ FailureOr<std::vector<StaticBarrier>> qualify_static_barriers(std::span<BasicBlo
                             block->start_offset(),
                             -1,
                             StaticBarrierScope::Workgroup,
-                            {member(instruction)}});
+                            {make_barrier_member(instruction)}});
         continue;
       }
       if (name != "s_barrier_signal" && name != "s_barrier_wait")
@@ -99,13 +99,13 @@ FailureOr<std::vector<StaticBarrier>> qualify_static_barriers(std::span<BasicBlo
                           block->start_offset(),
                           id,
                           id >= -2 ? StaticBarrierScope::Workgroup : StaticBarrierScope::Cluster,
-                          {member(instruction)}};
+                          {make_barrier_member(instruction)}};
       } else {
         const int32_t id = static_cast<int16_t>(word & 0xffffu);
         if (!pending || pending->barrier_id != id)
           return reject(error, StaticBarrierErrorCode::IncompleteBarrier, offset,
                         "wait has no matching same-block signal");
-        pending->members.push_back(member(instruction));
+        pending->members.push_back(make_barrier_member(instruction));
         barriers.push_back(std::move(*pending));
         pending.reset();
       }

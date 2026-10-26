@@ -50,6 +50,10 @@ struct FaultBarrierRecord;
 /// changing the caller's input buffer does not change this snapshot. The context
 /// caches the fixed all-entry direct-ownership profile and full-text edit facts.
 /// It does not support alternate roots/ranges/options or helper/indirect-analysis profiles.
+/// The caller/session should retain one context per immutable input across discovery,
+/// selection and apply, until all related operations finish. Repeated applies produce
+/// independent mutants of that original snapshot. To analyze a mutant, create a new
+/// context; the pristine context and its facts are never retargeted to changed bytes.
 class FaultMutationContext {
 public:
   explicit FaultMutationContext(std::span<const uint8_t> image);
@@ -63,6 +67,8 @@ public:
 private:
   class State;
   Result analyze() const;
+  // This context is the sole persistent strong source owner. The shared control block
+  // lets records/selections observe expiry via weak_ptr, including after address reuse.
   const std::shared_ptr<const AmdGpuCodeObject> source_;
   std::unique_ptr<State> state_;
   friend FailureOr<struct DropBarrierResult> apply_drop_barrier(const FaultMutationContext &,

@@ -43,8 +43,9 @@ FaultMutationError translate_edit_error(const TextEditError &edit) {
 
 // Called only after AmdGpuCodeObject validates segment extents and VA arithmetic.
 // Section payloads alone do not establish what a loader places at an address.
-std::optional<uint64_t> file_backed_address(std::span<const Elf64_Phdr> segments, uint64_t offset,
-                                            uint64_t size, uint32_t required_flags) {
+std::optional<uint64_t> resolve_file_backed_address(std::span<const Elf64_Phdr> segments,
+                                                    uint64_t offset, uint64_t size,
+                                                    uint32_t required_flags) {
   if (size == 0)
     return std::nullopt;
   const Elf64_Phdr *mapping = nullptr;
@@ -213,13 +214,14 @@ Result FaultMutationContext::analyze() const {
       read_elf_table<Elf64_Phdr>(image, header.e_phoff, header.e_phnum, header.e_phentsize);
   if (!segments)
     return reject(error, FaultMutationErrorCode::UnsupportedForm, "invalid program headers");
-  const auto text_address = file_backed_address(*segments, text.sectionOffset(), text.size(), PF_X);
+  const auto text_address =
+      resolve_file_backed_address(*segments, text.sectionOffset(), text.size(), PF_X);
   if (!text_address || *text_address != text.vaddr())
     return reject(error, FaultMutationErrorCode::UnsupportedForm,
                   "requires unambiguous file-backed executable .text at its declared address");
   for (const KernelDescriptorInfo &owner : kernels) {
-    const auto descriptor_address =
-        file_backed_address(*segments, owner.descriptor_file_offset, sizeof(owner.descriptor), 0);
+    const auto descriptor_address = resolve_file_backed_address(
+        *segments, owner.descriptor_file_offset, sizeof(owner.descriptor), 0);
     const auto loaded_entry =
         descriptor_address
             ? add_signed_offset(*descriptor_address, owner.descriptor.kernel_code_entry_byte_offset)

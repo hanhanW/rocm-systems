@@ -37,7 +37,7 @@ struct SourceDecoder {
   std::unique_ptr<Decoder> decoder;
 };
 
-std::optional<SourceDecoder> source_decoder(const AmdGpuCodeObject &source) {
+std::optional<SourceDecoder> create_source_decoder(const AmdGpuCodeObject &source) {
   const IsaTargetRegistry &registry = default_isa_target_registry();
   const rj_code_target_id_t target = source.target_id();
   const IsaTargetDescriptor *descriptor = nullptr;
@@ -143,7 +143,7 @@ Result CheckedTextEditContext::initialize(const InstructionBoundaries *boundarie
       text.sectionOffset() > source.image_size() ||
       text.size() > source.image_size() - text.sectionOffset())
     return reject(error, TextEditErrorCode::InvalidImage, "invalid .text extent");
-  state_->isa = source_decoder(source);
+  state_->isa = create_source_decoder(source);
   auto &isa = state_->isa;
   if (!isa)
     return reject(error, TextEditErrorCode::UnsupportedTarget,
