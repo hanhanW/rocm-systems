@@ -374,3 +374,84 @@ matching physical hardware. Required simulator cases must execute without skips;
 physical cases skip when the requested HSA agent is unavailable. Runtime-stage
 scenarios remain available without building the analyzer. Keep simulator and
 physical-target evidence distinct.
+
+## Fault injection
+
+FI01 provides an independent host-side mutation library in
+[`code/patch/fault_injection/drop_barrier.h`](../lib/rocjitsu/src/rocjitsu/code/patch/fault_injection/drop_barrier.h).
+It does not require ConSan compiler, runtime or analyzer components. It uses
+shared checked text edits, also used for general DBI anchor splicing. FI01 has
+no CLI; durable selection and file publication belong to FI03.
+
+Complete DropBarrier admits these registry-bound target/wave forms:
+
+| Family | Concrete targets | Wave sizes | Complete logical barrier |
+| --- | --- | --- | --- |
+| RDNA4 | gfx1200, gfx1201 | 32, 64 | Builtin signal/wait pair; IDs -1/-2, workgroup |
+| CDNA5 | gfx1250, gfx1251 | 32 | Builtin signal/wait pair; IDs -1/-2 workgroup, -3/-4 cluster |
+| CDNA3 | gfx942 | 64 | Full `s_barrier` singleton, workgroup |
+| CDNA4 | gfx950 | 64 | Full `s_barrier` singleton, workgroup |
+
+Inputs are little-endian AMDHSA ET_DYN ELF64 code-object-v5 images with one executable `.text`. Multiple
+independent kernels are supported; selection names exactly one kernel. The text
+and all descriptors must have unambiguous file-backed PT_LOAD mappings; each
+loaded descriptor's relative entry must resolve to its analyzed entry. Ambiguous
+names, aliased entries, shared blocks and unresolved ownership are rejected.
+An unselected section's executable flag alone does not make it another `.text`.
+Its bytes must be preserved without aliasing the edited text; declared executable
+function/kernel owners outside `.text` require broader ownership analysis.
+This is bounded image admission, not runtime qualification.
+
+Discovery requires an exact kernel name and closed direct CFG ownership.
+Non-barrier instructions may separate a split pair's members in one block.
+A `StaticBarrier` records its form and ordered members: two for a split pair,
+one for a true full barrier. A half-pair cannot become a singleton. This is
+distinct from GPU workgroup scope and FI22's group of two logical barriers.
+Select one complete barrier explicitly from the inventory:
+
+```cpp
+FaultMutationError error;
+const FaultMutationContext context(image);
+auto inventory = discover_drop_barriers(context, exact_entry_name, error);
+if (inventory.failed())
+  return Result::failure(); // Report error.code and error.message to the caller.
+
+// Explicitly choose selected_barrier from inventory.value().barriers.
+const auto selection = inventory.value().select(selected_barrier);
+auto mutant = apply_drop_barrier(context, selection, error);
+if (mutant.failed())
+  return Result::failure();
+// mutant.value().edit_result.image contains the validated device ELF.
+```
+
+The context owns an immutable copy of the source and supplies its target and
+architecture. A selection is bound to that context's lifetime; another context,
+even with identical bytes, requires a new selection. Caller buffer changes do
+not change the snapshot. No target argument or SHA-bound request is required;
+durable content binding and serialization belong to FI03.
+Decoding preserves the concrete target, including gfx1251 instruction features;
+it does not fall back to an architecture-default decoder. Capability listing
+uses the linked ISA registry and does not require simulator execution support.
+
+Apply rediscovers and matches the selected owner and complete ordered members,
+then replaces every member with a target NOP as one logical mutation. Other
+kernels, instructions, guest waits and metadata bytes remain unchanged. The
+independent validator checks exact changes and a fresh mutant inventory; it is
+also exposed as `validate_drop_barrier_candidate()`. Analysis is recomputed;
+this context does not cache a shared decoded program. Detailed contracts and
+typed failures are documented in the internal headers.
+
+Partial or interleaved pairs, dynamic operands, named barrier lifecycle,
+`signal_isfirst`, clauses, cross-block pairs, shared helpers/calls, indirect
+owners and firmware-preload entries are outside this first slice; broader
+ownership belongs to FI20 and broader Drop forms to FI22. Multi-text images
+remain unsupported. A qualified static barrier
+may be inside a direct loop: its removal affects every executed occurrence.
+There is no selection of one dynamic occurrence or proof of convergence.
+
+Use the mutant as a new original image for a **fresh ConSan prepare** before
+execution/capture and analysis; pristine artifacts and capture bindings cannot
+be reused. Preparation may independently reject a profile the mutation library
+admits. Mutation success validates the transformation only. Execution and
+detector qualification remain unverified: removing a barrier does not establish
+that a race occurs, that a run observes it, or that ConSan detects it.
