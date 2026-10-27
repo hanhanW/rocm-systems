@@ -138,8 +138,12 @@ struct DropTargetRow {
   uint32_t wave_size;
   bool split;
 };
+constexpr DropTargetRow kRdna3DropRows[] = {
+    {"Gfx1100Wave32", ROCJITSU_CODE_TARGET_GFX1100, ROCJITSU_CODE_ARCH_RDNA3, 32, false},
+    {"Gfx1100Wave64", ROCJITSU_CODE_TARGET_GFX1100, ROCJITSU_CODE_ARCH_RDNA3, 64, false},
+};
 // Columns: name, concrete target, architecture, wave size, split form. Keep rows
-// positional so the eight supported combinations can be compared column by column.
+// positional so the supported combinations can be compared column by column.
 constexpr DropTargetRow kDropRows[] = {
     {"Gfx1200Wave32", ROCJITSU_CODE_TARGET_GFX1200, ROCJITSU_CODE_ARCH_RDNA4, 32, true},
     {"Gfx1200Wave64", ROCJITSU_CODE_TARGET_GFX1200, ROCJITSU_CODE_ARCH_RDNA4, 64, true},
@@ -149,9 +153,15 @@ constexpr DropTargetRow kDropRows[] = {
     {"Gfx1251Wave32", ROCJITSU_CODE_TARGET_GFX1251, ROCJITSU_CODE_ARCH_CDNA5, 32, true},
     {"Gfx942Wave64", ROCJITSU_CODE_TARGET_GFX942, ROCJITSU_CODE_ARCH_CDNA3, 64, false},
     {"Gfx950Wave64", ROCJITSU_CODE_TARGET_GFX950, ROCJITSU_CODE_ARCH_CDNA4, 64, false},
+    kRdna3DropRows[0],
+    kRdna3DropRows[1],
 };
 
 std::vector<uint32_t> make_barrier_words(const DropTargetRow &row) {
+  // RDNA3 generated test_encodings.h: s_waitcnt and full s_barrier differ
+  // from CDNA. Offset 4/16 barriers surround unchanged waits and s_mov_b32.
+  if (row.arch == ROCJITSU_CODE_ARCH_RDNA3)
+    return {0xbf890000u, 0xbfbd0000u, kMov, 0xbf890000u, 0xbfbd0000u, build_s_endpgm(row.arch)};
   const uint32_t wait = row.split ? kGuestWait : 0xbf8c0000u;
   if (row.split)
     return {wait, kSignal, kMov, kWait, wait, kSignal, kMov, kWait, build_s_endpgm(row.arch)};
@@ -497,7 +507,9 @@ TEST_P(FaultDropBarrierFamily, StaticBarrierInLoopAndFamilySpecificForms) {
       const FaultMutationContext unsupported(make_barrier_elf_for_target(row, incomplete));
       EXPECT_TRUE(discover_drop_barriers(unsupported, "test_kernel", error).failed());
     }
-  } else {
+  } else if (row.arch == ROCJITSU_CODE_ARCH_CDNA3 || row.arch == ROCJITSU_CODE_ARCH_CDNA4) {
+    // CDNA's wave helper normalizes to 64; its raw Wave32 bit is still invalid.
+    // RDNA3 singleton barriers admit both descriptor-selected wave modes.
     DropTargetRow wrong_wave = row;
     wrong_wave.wave_size = 32;
     const FaultMutationContext unsupported(
@@ -556,7 +568,7 @@ TEST(FaultDropBarrier, RejectsFamiliesWithoutCompleteDropPolicyAndUnregisteredTa
   for (const uint32_t machine :
        {EF_AMDGPU_MACH_AMDGCN_GFX908, EF_AMDGPU_MACH_AMDGCN_GFX90A, EF_AMDGPU_MACH_AMDGCN_GFX940,
         EF_AMDGPU_MACH_AMDGCN_GFX941, EF_AMDGPU_MACH_AMDGCN_GFX1010, EF_AMDGPU_MACH_AMDGCN_GFX1030,
-        EF_AMDGPU_MACH_AMDGCN_GFX1100, EF_AMDGPU_MACH_AMDGCN_GFX1150, uint32_t{0xfe}}) {
+        EF_AMDGPU_MACH_AMDGCN_GFX1150, uint32_t{0xfe}}) {
     std::vector<uint8_t> image = make_gfx1250_barrier_elf();
     Elf64_Ehdr header{};
     std::memcpy(&header, image.data(), sizeof(header));
@@ -570,6 +582,165 @@ TEST(FaultDropBarrier, RejectsFamiliesWithoutCompleteDropPolicyAndUnregisteredTa
 }
 
 INSTANTIATE_TEST_SUITE_P(TargetWaves, FaultDropBarrierFamily, ::testing::ValuesIn(kDropRows),
+                         [](const ::testing::TestParamInfo<DropTargetRow> &info) {
+                           return info.param.name;
+                         });
+
+class FaultDropBarrierRdna3 : public ::testing::TestWithParam<DropTargetRow> {};
+
+TEST_P(FaultDropBarrierRdna3, GoldenEncodingsAndExactDeltaPreserveDescriptor) {
+  const DropTargetRow &row = GetParam();
+  const std::vector<uint32_t> words = make_barrier_words(row);
+  const std::vector<uint8_t> image = make_barrier_elf_for_target(row, words);
+  const FaultMutationContext context(image);
+  std::unique_ptr<Decoder> decoder = Decoder::create(default_isa_target_registry(), row.target);
+  ASSERT_TRUE(decoder);
+  // Golden bytes are independent of the production NOP emitter. RDNA3's
+  // s_barrier is SOPP 61; CDNA's SOPP 10 is s_wait_idle on this target.
+  constexpr uint32_t nop = 0xbf800000u;
+  EXPECT_EQ(build_s_nop(0, row.arch), nop);
+  constexpr std::array<std::string_view, 6> mnemonics{"s_waitcnt", "s_barrier", "s_mov_b32",
+                                                      "s_waitcnt", "s_barrier", "s_endpgm"};
+  ASSERT_EQ(words.size(), mnemonics.size());
+  for (size_t index = 0; index < words.size(); ++index) {
+    DecodeResult instruction = decoder->decode_window(std::span(words).subspan(index), index * 4);
+    ASSERT_TRUE(instruction.succeeded()) << index;
+    EXPECT_EQ(instruction.value()->size(), 4u);
+    EXPECT_EQ(instruction.value()->mnemonic(), mnemonics[index]);
+  }
+  FaultMutationError error;
+  const FailureOr<FaultBarrierInventory> inventory =
+      discover_drop_barriers(context, "test_kernel", error);
+  ASSERT_TRUE(inventory.succeeded()) << error.message;
+  ASSERT_EQ(inventory.value().barriers().size(), 2u);
+  for (size_t index = 0; index < 2; ++index) {
+    const StaticBarrier &barrier = inventory.value().barriers()[index];
+    EXPECT_EQ(barrier.form, StaticBarrierForm::FullSingleton);
+    EXPECT_EQ(barrier.scope, StaticBarrierScope::Workgroup);
+    EXPECT_EQ(barrier.barrier_id, -1);
+    ASSERT_EQ(barrier.members.size(), 1u);
+    EXPECT_EQ(barrier.members.front().offset, index == 0 ? 4u : 16u);
+    EXPECT_EQ(barrier.members.front().bytes, (std::vector<uint8_t>{0, 0, 0xbd, 0xbf}));
+  }
+  const FailureOr<DropBarrierSelection> second =
+      select_drop_barrier(inventory.value(), {.exact = std::nullopt, .ordinal = 1}, error);
+  ASSERT_TRUE(second.succeeded());
+  const FailureOr<DropBarrierSelection> exact =
+      select_drop_barrier(inventory.value(), {.exact = second.value(), .ordinal = 0}, error);
+  ASSERT_TRUE(exact.succeeded());
+  const FailureOr<DropBarrierResult> result = apply_drop_barrier(context, exact.value(), error);
+  ASSERT_TRUE(result.succeeded()) << error.message;
+  EXPECT_EQ(result.value().logical_mutation_count, 1u);
+  ASSERT_EQ(result.value().edit_result.edits.size(), 1u);
+  EXPECT_EQ(result.value().edit_result.edits.front().offset, 16u);
+  EXPECT_EQ(result.value().edit_result.edits.front().replacement,
+            (std::vector<uint8_t>{0, 0, 0x80, 0xbf}));
+  std::vector<uint8_t> expected = image;
+  const uint64_t selected = inventory.value().section().file_offset + 16;
+  std::memcpy(expected.data() + selected, &nop, sizeof(nop));
+  EXPECT_EQ(result.value().edit_result.image, expected);
+  EXPECT_EQ(result.value().edit_result.target, ROCJITSU_CODE_TARGET_GFX1100);
+  const FaultMutationContext mutant(result.value().edit_result.image);
+  const Section &text = *mutant.source().text_sections().front();
+  const std::vector<KernelDescriptorInfo> descriptors = scan_kernel_descriptors(
+      mutant.image(), text.sectionOffset(), text.size(), text.sectionHeaderIndex());
+  ASSERT_EQ(descriptors.size(), 1u);
+  EXPECT_EQ(kernel_wavefront_size(row.arch, descriptors.front().descriptor), row.wave_size);
+  EXPECT_EQ((descriptors.front().descriptor.kernel_code_properties &
+             amdhsa::KERNEL_CODE_PROPERTY_ENABLE_WAVEFRONT_SIZE32) != 0,
+            row.wave_size == 32);
+  EXPECT_EQ(descriptors.front().entry_text_offset, 0u);
+  EXPECT_EQ(descriptors.front().descriptor_file_offset,
+            inventory.value().owner().descriptor_file_offset);
+  EXPECT_EQ(std::memcmp(mutant.image().data() + descriptors.front().descriptor_file_offset,
+                        image.data() + inventory.value().owner().descriptor_file_offset,
+                        sizeof(amdhsa::kernel_descriptor_t)),
+            0);
+  EXPECT_TRUE(matches_drop_output(context, exact.value(), mutant.image(), error).succeeded());
+  expected[selected] = 1; // A decoded s_nop with a different cycle count is not this recipe.
+  EXPECT_TRUE(matches_drop_output(context, exact.value(), expected, error).failed());
+}
+
+TEST_P(FaultDropBarrierRdna3, CdnaBarrierEncodingIsAnOrdinaryWait) {
+  const DropTargetRow &row = GetParam();
+  const std::array<uint32_t, 1> words{0xbf8a0000u};
+  std::unique_ptr<Decoder> decoder = Decoder::create(default_isa_target_registry(), row.target);
+  ASSERT_TRUE(decoder);
+  DecodeResult instruction = decoder->decode_window(words, 0);
+  ASSERT_TRUE(instruction.succeeded());
+  EXPECT_EQ(instruction.value()->mnemonic(), "s_wait_idle");
+  EXPECT_FALSE(instruction.value()->is_barrier());
+  const FaultMutationContext context(
+      make_barrier_elf_for_target(row, {words.front(), build_s_endpgm(row.arch)}));
+  FaultMutationError error;
+  const FailureOr<FaultBarrierInventory> inventory =
+      discover_drop_barriers(context, "test_kernel", error);
+  ASSERT_TRUE(inventory.succeeded()) << error.message;
+  EXPECT_TRUE(inventory.value().barriers().empty());
+  EXPECT_TRUE(select_drop_barrier(inventory.value(), {}, error).failed());
+  EXPECT_EQ(error.code, FaultMutationErrorCode::NoCandidates);
+}
+
+TEST_P(FaultDropBarrierRdna3, RejectsOtherBarrierFormsAndClauseMembers) {
+  const DropTargetRow &row = GetParam();
+  // RDNA3 ds_gws_barrier is not a full workgroup s_barrier. A clause member
+  // and foreign split encodings also cannot enter this singleton inventory.
+  for (const std::vector<uint32_t> &words :
+       std::vector<std::vector<uint32_t>>{{0xd8740000u, 0, 0xbfbd0000u, build_s_endpgm(row.arch)},
+                                          {0xbf850000u, 0xbfbd0000u, build_s_endpgm(row.arch)},
+                                          {kGuestWait, kSignal, kMov, kWait, kGuestWait, kEnd}}) {
+    const FaultMutationContext context(make_barrier_elf_for_target(row, words));
+    FaultMutationError error;
+    EXPECT_TRUE(discover_drop_barriers(context, "test_kernel", error).failed());
+    EXPECT_EQ(error.code, FaultMutationErrorCode::UnsupportedForm) << error.message;
+  }
+}
+
+TEST_P(FaultDropBarrierRdna3, SelectionCannotReplayChangedWaveEntryOrTarget) {
+  const DropTargetRow &row = GetParam();
+  const std::vector<uint8_t> image = make_barrier_elf_for_target(row, make_barrier_words(row));
+  const FaultMutationContext context(image);
+  FaultMutationError error;
+  const FailureOr<FaultBarrierInventory> inventory =
+      discover_drop_barriers(context, "test_kernel", error);
+  ASSERT_TRUE(inventory.succeeded()) << error.message;
+  const DropBarrierSelection selection = select_barrier_for_test(inventory.value(), 1);
+  for (int mode = 0; mode < 3; ++mode) {
+    SCOPED_TRACE(mode);
+    std::vector<uint8_t> changed = image;
+    amdhsa::kernel_descriptor_t descriptor{};
+    const uint64_t offset = inventory.value().owner().descriptor_file_offset;
+    std::memcpy(&descriptor, changed.data() + offset, sizeof(descriptor));
+    if (mode == 0)
+      descriptor.kernel_code_properties ^= amdhsa::KERNEL_CODE_PROPERTY_ENABLE_WAVEFRONT_SIZE32;
+    else if (mode == 1)
+      descriptor.kernel_code_entry_byte_offset += 4;
+    else {
+      Elf64_Ehdr header{};
+      std::memcpy(&header, changed.data(), sizeof(header));
+      header.e_flags = EF_AMDGPU_MACH_AMDGCN_GFX1200;
+      std::memcpy(changed.data(), &header, sizeof(header));
+    }
+    std::memcpy(changed.data() + offset, &descriptor, sizeof(descriptor));
+    const FaultMutationContext other(changed);
+    EXPECT_TRUE(apply_drop_barrier(other, selection, error).failed());
+    EXPECT_EQ(error.code, FaultMutationErrorCode::BadIdentity);
+    if (mode < 2) {
+      const FailureOr<FaultBarrierInventory> fresh =
+          discover_drop_barriers(other, "test_kernel", error);
+      ASSERT_TRUE(fresh.succeeded()) << error.message;
+      EXPECT_TRUE(
+          select_drop_barrier(fresh.value(), {.exact = selection, .ordinal = 0}, error).failed());
+      EXPECT_EQ(error.code, FaultMutationErrorCode::BadIdentity);
+    }
+  }
+  const FailureOr<DropBarrierResult> result = apply_drop_barrier(context, selection, error);
+  ASSERT_TRUE(result.succeeded());
+  EXPECT_TRUE(
+      matches_drop_output(context, selection, result.value().edit_result.image, error).succeeded());
+}
+
+INSTANTIATE_TEST_SUITE_P(Rdna3Waves, FaultDropBarrierRdna3, ::testing::ValuesIn(kRdna3DropRows),
                          [](const ::testing::TestParamInfo<DropTargetRow> &info) {
                            return info.param.name;
                          });

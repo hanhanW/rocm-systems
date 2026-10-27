@@ -394,10 +394,15 @@ Result FaultMutationContext::analyze() const {
                      .descriptor_file_offset = owner.descriptor_file_offset};
     record->source = source_;
     const uint32_t wave = kernel_wavefront_size(target_facts->architecture_id, owner.descriptor);
+    // The shared helper normalizes CDNA3/4 to Wave64 even if the raw Wave32 bit
+    // is set. Check that bit against family policy, independently of barrier form:
+    // RDNA3 full singletons admit both waves; CDNA3/4 full singletons do not.
+    const bool descriptor_requests_wave32 =
+        (owner.descriptor.kernel_code_properties &
+         amdhsa::KERNEL_CODE_PROPERTY_ENABLE_WAVEFRONT_SIZE32) != 0;
     if (std::ranges::find(policy->wave_sizes, wave) == policy->wave_sizes.end() ||
-        (policy->form == StaticBarrierForm::FullSingleton &&
-         (owner.descriptor.kernel_code_properties &
-          amdhsa::KERNEL_CODE_PROPERTY_ENABLE_WAVEFRONT_SIZE32) != 0)) {
+        (descriptor_requests_wave32 &&
+         std::ranges::find(policy->wave_sizes, 32u) == policy->wave_sizes.end())) {
       record->error = {.code = FaultMutationErrorCode::UnsupportedForm,
                        .offset = 0,
                        .message = "descriptor wave mode is not admitted by this barrier family"};

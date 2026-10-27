@@ -377,110 +377,19 @@ physical-target evidence distinct.
 
 ## Fault injection
 
-FI01 provides an independent host-side mutation library in
-[`code/patch/fault_injection/drop_barrier.h`](../lib/rocjitsu/src/rocjitsu/code/patch/fault_injection/drop_barrier.h).
-It does not require ConSan compiler, runtime or analyzer components. It uses
-shared checked text edits, also used for general DBI anchor splicing. FI01 has
-no CLI; durable selection and file publication belong to FI03.
+The independent offline fault-injection library can remove a qualified complete
+barrier from an AMDGPU code object. It uses shared DBI checked edits and does not
+require the ConSan compiler, runtime, or analyzer. See
+[Fault injection](fault-injection.md) for its architecture, library interface,
+current features, target/wave coverage, and limitations.
 
-Complete DropBarrier admits these registry-bound target/wave forms:
+Treat the mutant as a new original image: perform a **fresh ConSan prepare**,
+then execution/capture → analyze. Do not reuse pristine prepared artifacts or
+capture bindings. Preparation may reject a target or program profile that the
+mutation library admits; detector admission is independent of mutation admission.
 
-| Family | Concrete targets | Wave sizes | Complete logical barrier |
-| --- | --- | --- | --- |
-| RDNA4 | gfx1200, gfx1201 | 32, 64 | Builtin signal/wait pair; IDs -1/-2, workgroup |
-| CDNA5 | gfx1250, gfx1251 | 32 | Builtin signal/wait pair; IDs -1/-2 workgroup, -3/-4 cluster |
-| CDNA3 | gfx942 | 64 | Full `s_barrier` singleton, workgroup |
-| CDNA4 | gfx950 | 64 | Full `s_barrier` singleton, workgroup |
-
-Inputs are little-endian AMDHSA ET_DYN ELF64 code-object-v5 images with one executable `.text`. Multiple
-independent kernels are supported; selection names exactly one kernel. The text
-and all descriptors must have unambiguous file-backed PT_LOAD mappings; each
-loaded descriptor's relative entry must resolve to its analyzed entry. Ambiguous
-names, aliased entries, shared blocks and unresolved ownership are rejected.
-An unselected section's executable flag alone does not make it another `.text`.
-Its bytes must be preserved without aliasing the edited text; declared executable
-function/kernel owners outside `.text` require broader ownership analysis.
-This is bounded image admission, not runtime qualification.
-
-Discovery requires an exact kernel name and closed direct CFG ownership.
-Non-barrier instructions may separate a split pair's members in one block.
-A `StaticBarrier` records its form and ordered members: two for a split pair,
-one for a true full barrier. A half-pair cannot become a singleton. This is
-distinct from GPU workgroup scope and FI22's group of two logical barriers.
-Keep one context in the input/session owner and reuse it for the requested
-selections. Each request below produces an independent mutant of the same original:
-
-```cpp
-FaultMutationError error;
-const FaultMutationContext context(image); // Retain for this input's whole session.
-FailureOr<FaultBarrierInventory> inventory = discover_drop_barriers(context, exact_entry_name, error);
-if (inventory.failed())
-  return Result::failure(); // Report error.code and error.message to the caller.
-
-// The caller supplies requested_selections. A default-initialized selector uses
-// logical ordinal zero; .exact overrides the ordinal without fallback on failure.
-for (const DropBarrierSelector &request : requested_selections) {
-  FailureOr<DropBarrierSelection> selection = select_drop_barrier(inventory.value(), request, error);
-  if (selection.failed())
-    return Result::failure();
-  FailureOr<DropBarrierResult> mutant = apply_drop_barrier(context, selection.value(), error);
-  if (mutant.failed())
-    return Result::failure();
-  // Consume or retain mutant.value().edit_result.image for this request.
-}
-```
-
-For a single-input CLI, the context can live for the entire process. A runner
-handling several images should retain a separate context per image until its
-related operations finish; this is not a process-global context. Further kernel
-discovery on the same context reuses its source facts. To analyze or mutate an
-emitted mutant, create a new context from its bytes and obtain new selections;
-do not replace the pristine context's source or reuse its facts for changed bytes.
-
-The context owns an immutable copy of the source and supplies its target and
-architecture. A selection is bound to that context's lifetime; another context,
-even with identical bytes, requires a new selection. Caller buffer changes do
-not change the snapshot. No target argument or SHA-bound request is required;
-durable content binding and serialization belong to FI03.
-Decoding preserves the concrete target, including gfx1251 instruction features;
-it does not fall back to an architecture-default decoder. Capability listing
-uses the linked ISA registry and does not require simulator execution support.
-
-The selector orders complete logical barriers by their original first-member
-text offset. An exact context-bound selector takes precedence over the zero-based
-ordinal, including when the ordinal is out of range. Invalid exact selectors never
-fall back. Default-first is a deterministic baseline, not a race heuristic; these
-logical ordinals are not compatible with prototype physical-site indices. The
-explicit legacy adapter belongs to FI21.
-
-The context builds all-entry direct CFG ownership and per-kernel qualification once.
-Inventories share immutable records; apply checks the private record and complete
-ordered members, then emits a target NOP for every member as one logical mutation.
-Full-text structural facts are cached separately because unreachable references
-are outside the ownership CFG. Instrumentor reuses its private full-section
-instruction/clause index through the same checked-edit machinery. No global
-cache or caller-supplied target/analysis override is involved.
-
-Runtime checks source/selection integrity, source format, ranges, references and
-replacement encoding before emission. Equal-length writes retain the existing
-CodeObjectPatcher layout contract. There is no production candidate validator or
-fresh mutant CFG pass. Recipe/emitter tests independently check NOP encodings,
-exact image deltas, remaining inventory, unselected kernels/guest waits and
-metadata, including corrupted-output controls. Parser validity alone would not
-prove correct Drop semantics; results do not claim per-artifact runtime semantic
-validation. Detailed input contracts and typed failures are in the internal headers.
-
-Partial or interleaved pairs, dynamic operands, named barrier lifecycle,
-`signal_isfirst`, clauses, cross-block pairs, shared helpers/calls, indirect
-owners and firmware-preload entries are outside this first slice; broader
-ownership belongs to FI20 and broader Drop forms to FI22. Multi-text images
-remain unsupported. A qualified static barrier
-may be inside a direct loop: its removal affects every executed occurrence.
-There is no selection of one dynamic occurrence or proof of convergence.
-
-Use the mutant as a new original image for a **fresh ConSan prepare** before
-execution/capture and analysis; pristine artifacts and capture bindings cannot
-be reused. Preparation may independently reject a profile the mutation library
-admits. Mutation success reports emission after input qualification. Execution and
-detector qualification remain unverified: removing a barrier does not establish
-that a race occurs, that a run observes it, or that ConSan detects it.
+Mutation success reports emission after input qualification. It establishes
+neither execution nor detector qualification: removing a barrier does not prove
+that a race occurs, that a particular execution observes it, or that ConSan
+reports it. Qualify those stages separately using the normal capture and analysis
+workflow.

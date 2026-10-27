@@ -41,6 +41,10 @@ std::optional<StaticBarrierPolicy> static_barrier_policy(rj_code_target_id_t tar
   static constexpr std::array<uint32_t, 1> wave32{32};
   static constexpr std::array<uint32_t, 1> wave64{64};
   switch (family->architecture_id) {
+  case ROCJITSU_CODE_ARCH_RDNA3:
+    return StaticBarrierPolicy{.form = StaticBarrierForm::FullSingleton,
+                               .wave_sizes = rdna_waves,
+                               .minimum_builtin_id = -1};
   case ROCJITSU_CODE_ARCH_RDNA4:
     return StaticBarrierPolicy{.form = StaticBarrierForm::BuiltinSplitPair,
                                .wave_sizes = rdna_waves,

@@ -61,7 +61,7 @@ static_barrier_policy(rj_code_target_id_t target,
 
 /// @brief Qualify complete builtin split pairs or full singleton barriers.
 /// @details RDNA4 accepts immediate IDs -1/-2; CDNA5 also accepts -3/-4 (cluster).
-/// CDNA3/CDNA4 accept full s_barrier. Named lifecycle, dynamic operands, isfirst
+/// RDNA3/CDNA3/CDNA4 accept full s_barrier. Named lifecycle, dynamic operands, isfirst
 /// (SCC side effect), interleaved and cross-block pairs fail closed. Ownership
 /// and closed CFG checks belong to the caller. No convergence or race verdict.
 [[nodiscard]] FailureOr<std::vector<StaticBarrier>>
