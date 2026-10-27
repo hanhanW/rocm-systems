@@ -48,7 +48,7 @@ std::optional<SourceDecoder> create_source_decoder(const AmdGpuCodeObject &sourc
   } else {
     if (source.image_size() < sizeof(Elf64_Ehdr))
       return std::nullopt;
-    Elf64_Ehdr header{};
+    Elf64_Ehdr header = {};
     std::memcpy(&header, source.image_data(), sizeof(header));
     descriptor = registry.find(arch_for_elf_mach(header.e_flags));
     // Legacy ELF identities can use a family decoder only when the provider
@@ -97,7 +97,7 @@ class CheckedTextEditContext::State {
 public:
   explicit State(const AmdGpuCodeObject &object) : source(object) {}
   const AmdGpuCodeObject &source;
-  TextSectionIdentity section{};
+  TextSectionIdentity section = {};
   std::vector<Elf64_Shdr> sections;
   std::optional<SourceDecoder> isa;
   InstructionBoundaries owned_boundaries;
@@ -156,7 +156,7 @@ Result CheckedTextEditContext::initialize(const InstructionBoundaries *boundarie
     return size != 0 && offset < text.sectionOffset() + text.size() &&
            (offset >= text.sectionOffset() || size > text.sectionOffset() - offset);
   };
-  Elf64_Ehdr header{};
+  Elf64_Ehdr header = {};
   std::memcpy(&header, source.image_data(), sizeof(header));
   if (aliases_text(0, sizeof(header)) ||
       aliases_text(header.e_shoff, uint64_t{header.e_shnum} * header.e_shentsize) ||

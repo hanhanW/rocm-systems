@@ -27,7 +27,6 @@ enum class TextEditErrorCode {
   StaleBytes,
   InvalidInstruction,
   Clause,
-  ValidationFailure,
 };
 
 struct TextEditError {
@@ -42,7 +41,6 @@ struct TextSectionIdentity {
   uint64_t file_offset = 0;
   uint64_t vaddr = 0;
   uint64_t size = 0;
-  bool operator==(const TextSectionIdentity &) const = default;
 };
 
 /// @brief Replace one complete original instruction with equally many bytes.

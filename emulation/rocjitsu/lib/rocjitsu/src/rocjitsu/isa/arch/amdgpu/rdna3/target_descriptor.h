@@ -10,11 +10,11 @@
 
 namespace rocjitsu::rdna3 {
 
-inline constexpr std::array<std::string_view, 1> kTargetAliases{"gfx1100"};
-inline constexpr std::array<IsaGpuTargetDescription, 1> kModelGpuTargets{{
+inline constexpr std::array<std::string_view, 1> kTargetAliases = {"gfx1100"};
+inline constexpr std::array<IsaGpuTargetDescription, 1> kModelGpuTargets = {{
     {ROCJITSU_CODE_TARGET_GFX1100, "gfx1100", EF_AMDGPU_MACH_AMDGCN_GFX1100},
 }};
-inline constexpr std::array<IsaGpuTargetDescription, 1> kExecutionGpuTargets{{
+inline constexpr std::array<IsaGpuTargetDescription, 1> kExecutionGpuTargets = {{
     {ROCJITSU_CODE_TARGET_GFX1100,
      "gfx1100",
      EF_AMDGPU_MACH_AMDGCN_GFX1100,

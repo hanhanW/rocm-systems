@@ -863,7 +863,7 @@ bool Instrumentor::ensure_blocks_built(std::string *error_out) {
       return false;
     }
   } else if (obj_.image_size() >= sizeof(Elf64_Ehdr)) {
-    Elf64_Ehdr header{};
+    Elf64_Ehdr header = {};
     std::memcpy(&header, obj_.image_data(), sizeof(header));
     const rj_code_arch_t source_arch = arch_for_elf_mach(header.e_flags);
     if (source_arch != ROCJITSU_CODE_ARCH_INVALID && source_arch != arch_) {

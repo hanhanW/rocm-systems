@@ -821,7 +821,7 @@ TEST_P(InstrumentorSourceTarget, OrdinaryPatchPreservesIdentityAndGuestReturn) {
   const AmdGpuCodeObject candidate(result.elf_bytes.data(), result.elf_bytes.size());
   ASSERT_TRUE(candidate.is_valid());
   EXPECT_EQ(candidate.target_id(), source.target_id());
-  Elf64_Ehdr before{}, after{};
+  Elf64_Ehdr before = {}, after = {};
   std::memcpy(&before, image.data(), sizeof(before));
   std::memcpy(&after, result.elf_bytes.data(), sizeof(after));
   EXPECT_EQ(after.e_flags, before.e_flags);
@@ -866,9 +866,9 @@ TEST(InstrumentorPatch, PreservesAdditionalExecutableSectionAndDescriptorMapping
   constexpr rj_code_arch_t arch = ROCJITSU_CODE_ARCH_CDNA4;
   std::vector<uint8_t> image = make_amdgpu_kernel_elf({build_s_nop(0, arch), build_s_endpgm(arch)},
                                                       0, 3, EF_AMDGPU_MACH_AMDGCN_GFX950);
-  Elf64_Ehdr header{};
+  Elf64_Ehdr header = {};
   std::memcpy(&header, image.data(), sizeof(header));
-  Elf64_Shdr rodata{};
+  Elf64_Shdr rodata = {};
   const size_t section_header = header.e_shoff + 2 * sizeof(Elf64_Shdr);
   std::memcpy(&rodata, image.data() + section_header, sizeof(rodata));
   rodata.sh_flags |= SHF_EXECINSTR;
@@ -889,7 +889,7 @@ TEST(InstrumentorPatch, PreservesAdditionalExecutableSectionAndDescriptorMapping
   EXPECT_EQ(after.sh_size, rodata.sh_size);
   auto expected = std::vector<uint8_t>(image.begin() + rodata.sh_offset,
                                        image.begin() + rodata.sh_offset + rodata.sh_size);
-  amdhsa::kernel_descriptor_t descriptor{};
+  amdhsa::kernel_descriptor_t descriptor = {};
   std::memcpy(&descriptor, expected.data(), sizeof(descriptor));
   // Layout growth moves the descriptor; only its relative entry field must change.
   descriptor.kernel_code_entry_byte_offset +=

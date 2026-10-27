@@ -59,27 +59,23 @@ std::vector<CheckedTextEdit> make_mixed_width_nop_edits() {
 }
 
 // Test-side exact-image oracle, independent of the production transaction.
-Result matches_checked_output(const AmdGpuCodeObject &source,
-                              std::span<const CheckedTextEdit> edits,
-                              std::span<const uint8_t> candidate, TextEditError &error) {
+testing::AssertionResult matches_checked_output(const AmdGpuCodeObject &source,
+                                                std::span<const CheckedTextEdit> edits,
+                                                std::span<const uint8_t> candidate) {
   const auto *data = reinterpret_cast<const uint8_t *>(source.image_data());
   std::vector<uint8_t> expected(data, data + source.image_size());
   const Section &text = *source.text_sections().front();
   for (const CheckedTextEdit &edit : edits) {
     if (edit.offset > text.size() || edit.replacement.size() > text.size() - edit.offset)
-      return Result::failure();
+      return testing::AssertionFailure() << "test oracle: edit outside .text at " << edit.offset;
     std::memcpy(expected.data() + text.sectionOffset() + edit.offset, edit.replacement.data(),
                 edit.replacement.size());
   }
   const AmdGpuCodeObject parsed(candidate.data(), candidate.size());
   if (!parsed.is_valid() || parsed.target_id() != source.target_id() ||
-      !std::ranges::equal(expected, candidate)) {
-    error = {.code = TextEditErrorCode::ValidationFailure,
-             .offset = 0,
-             .message = "test oracle: unexpected output bytes"};
-    return Result::failure();
-  }
-  return Result::success();
+      !std::ranges::equal(expected, candidate))
+    return testing::AssertionFailure() << "test oracle: unexpected output bytes or target";
+  return testing::AssertionSuccess();
 }
 
 TEST(CheckedTextEdits, ReusableFactsKeepRequestChecksAndSourceIdentity) {
@@ -94,8 +90,7 @@ TEST(CheckedTextEdits, ReusableFactsKeepRequestChecksAndSourceIdentity) {
     const FailureOr<CheckedTextEditResult> result =
         apply_checked_text_edits(*context.value(), original_edits, error);
     ASSERT_TRUE(result.succeeded()) << error.message;
-    EXPECT_TRUE(
-        matches_checked_output(source, original_edits, result.value().image, error).succeeded());
+    EXPECT_TRUE(matches_checked_output(source, original_edits, result.value().image));
     std::vector<CheckedTextEdit> stale = original_edits;
     stale.back().expected[0] ^= 1;
     EXPECT_TRUE(apply_checked_text_edits(*context.value(), stale, error).failed());
@@ -117,9 +112,9 @@ TEST(CheckedTextEdits, CachedFullTextFactsIncludeUnreachableReferences) {
       CheckedTextEditContext::create(source, error);
   ASSERT_TRUE(context.succeeded()) << error.message;
   const uint32_t nop = build_s_nop(0, kArch);
-  const CheckedTextEdit edit{.offset = 0,
-                             .expected = make_instruction_bytes({0xbe8000ffu, 0x12345678u}),
-                             .replacement = make_instruction_bytes({nop, nop})};
+  const CheckedTextEdit edit = {.offset = 0,
+                                .expected = make_instruction_bytes({0xbe8000ffu, 0x12345678u}),
+                                .replacement = make_instruction_bytes({nop, nop})};
   for (int attempt = 0; attempt < 2; ++attempt) {
     EXPECT_TRUE(apply_checked_text_edits(*context.value(), std::span(&edit, 1), error).failed());
     EXPECT_EQ(error.code, TextEditErrorCode::UnsupportedReferences) << error.message;
@@ -145,13 +140,12 @@ TEST(CheckedTextEdits, ThreeNonadjacentCompleteExtentsPreserveAllOtherImageBytes
   EXPECT_EQ(result.value().mapping.front().candidate_offset, 0u);
   EXPECT_EQ(result.value().mapping.front().size, 36u);
   EXPECT_EQ(std::memcmp(object.image_data(), image.data(), image.size()), 0);
-  EXPECT_TRUE(matches_checked_output(object, requests, result.value().image, error).succeeded())
-      << error.message;
+  EXPECT_TRUE(matches_checked_output(object, requests, result.value().image));
 }
 
 TEST(CheckedTextEdits, SectionOnlyTransformationDoesNotRequireLoadMapping) {
   std::vector<uint8_t> image = make_mixed_width_kernel_elf();
-  Elf64_Ehdr header{};
+  Elf64_Ehdr header = {};
   std::memcpy(&header, image.data(), sizeof(header));
   header.e_phnum = 0;
   std::memcpy(image.data(), &header, sizeof(header));
@@ -160,8 +154,7 @@ TEST(CheckedTextEdits, SectionOnlyTransformationDoesNotRequireLoadMapping) {
   const std::vector<CheckedTextEdit> requests = make_mixed_width_nop_edits();
   const FailureOr<CheckedTextEditResult> result = apply_checked_text_edits(object, requests, error);
   ASSERT_TRUE(result.succeeded()) << error.message;
-  EXPECT_TRUE(matches_checked_output(object, requests, result.value().image, error).succeeded())
-      << error.message;
+  EXPECT_TRUE(matches_checked_output(object, requests, result.value().image));
 }
 
 TEST(CheckedTextEdits, Gfx1100CallableConsumerRetainsSourceTarget) {
@@ -171,9 +164,9 @@ TEST(CheckedTextEdits, Gfx1100CallableConsumerRetainsSourceTarget) {
   const std::vector<uint8_t> image = test::make_amdgpu_kernel_elf(
       {original, build_s_endpgm(arch)}, 0, 3, EF_AMDGPU_MACH_AMDGCN_GFX1100);
   const AmdGpuCodeObject source(image.data(), image.size());
-  const std::vector<CheckedTextEdit> requests{{.offset = 0,
-                                               .expected = make_instruction_bytes({original}),
-                                               .replacement = make_instruction_bytes({nop})}};
+  const std::vector<CheckedTextEdit> requests = {{.offset = 0,
+                                                  .expected = make_instruction_bytes({original}),
+                                                  .replacement = make_instruction_bytes({nop})}};
   TextEditError error;
   const FailureOr<CheckedTextEditResult> result = apply_checked_text_edits(source, requests, error);
   ASSERT_TRUE(result.succeeded()) << error.message;
@@ -182,7 +175,7 @@ TEST(CheckedTextEdits, Gfx1100CallableConsumerRetainsSourceTarget) {
   std::vector<uint8_t> expected = image;
   std::memcpy(expected.data() + source.text_sections().front()->sectionOffset(), &nop, sizeof(nop));
   EXPECT_EQ(result.value().image, expected);
-  EXPECT_TRUE(matches_checked_output(source, requests, result.value().image, error).succeeded());
+  EXPECT_TRUE(matches_checked_output(source, requests, result.value().image));
 }
 
 TEST(CheckedTextEdits, LegacyElfIdentityIsSourceDerivedAndUnchanged) {
@@ -191,7 +184,7 @@ TEST(CheckedTextEdits, LegacyElfIdentityIsSourceDerivedAndUnchanged) {
       {build_s_nop(1, arch), build_s_endpgm(arch)}, 0, 3, EF_AMDGPU_MACH_AMDGCN_GFX908);
   const AmdGpuCodeObject source(image.data(), image.size());
   ASSERT_EQ(source.target_id(), ROCJITSU_CODE_TARGET_INVALID);
-  const std::vector<CheckedTextEdit> requests{
+  const std::vector<CheckedTextEdit> requests = {
       {.offset = 0,
        .expected = make_instruction_bytes({build_s_nop(1, arch)}),
        .replacement = make_instruction_bytes({build_s_nop(0, arch)})}};
@@ -203,15 +196,15 @@ TEST(CheckedTextEdits, LegacyElfIdentityIsSourceDerivedAndUnchanged) {
   std::memcpy(expected.data() + result.value().section.file_offset,
               requests.front().replacement.data(), 4);
   EXPECT_EQ(result.value().image, expected);
-  EXPECT_TRUE(matches_checked_output(source, requests, expected, error).succeeded());
+  EXPECT_TRUE(matches_checked_output(source, requests, expected));
   for (const uint32_t machine :
        {EF_AMDGPU_MACH_NONE, uint32_t{0xfe}, EF_AMDGPU_MACH_AMDGCN_GFX1010}) {
     std::vector<uint8_t> corrupt = expected;
-    Elf64_Ehdr header{};
+    Elf64_Ehdr header = {};
     std::memcpy(&header, corrupt.data(), sizeof(header));
     header.e_flags = machine;
     std::memcpy(corrupt.data(), &header, sizeof(header));
-    EXPECT_TRUE(matches_checked_output(source, requests, corrupt, error).failed());
+    EXPECT_FALSE(matches_checked_output(source, requests, corrupt));
     if (machine != EF_AMDGPU_MACH_AMDGCN_GFX1010) {
       const AmdGpuCodeObject unknown(corrupt.data(), corrupt.size());
       EXPECT_TRUE(apply_checked_text_edits(unknown, requests, error).failed());
@@ -281,9 +274,9 @@ TEST(CheckedTextEdits, RejectsTruncatedOriginalEightAndTwelveByteInstructions) {
        std::vector<std::vector<uint32_t>>{{0xbe8000ffu}, {0xee068002u, 0x00800000u}}) {
     const std::vector<uint8_t> image = test::make_gfx1200_kernel_elf(words, 0);
     const AmdGpuCodeObject object(image.data(), image.size());
-    CheckedTextEdit edit{.offset = 0,
-                         .expected = std::vector<uint8_t>(words.size() * 4),
-                         .replacement = std::vector<uint8_t>(words.size() * 4)};
+    CheckedTextEdit edit = {.offset = 0,
+                            .expected = std::vector<uint8_t>(words.size() * 4),
+                            .replacement = std::vector<uint8_t>(words.size() * 4)};
     std::memcpy(edit.expected.data(), words.data(), edit.expected.size());
     for (size_t offset = 0; offset < edit.replacement.size(); offset += 4) {
       const uint32_t nop = build_s_nop(0, kArch);
@@ -305,10 +298,10 @@ TEST(CheckedTextEdits, EmitterOracleRejectsTextMetadataAndTargetCorruption) {
   for (const size_t offset : {size_t{0x104}, size_t{0x100}, size_t{48}, size_t{0x100 + 36}}) {
     std::vector<uint8_t> candidate = result.value().image;
     candidate[offset] ^= 1;
-    EXPECT_TRUE(matches_checked_output(object, requests, candidate, error).failed()) << offset;
+    EXPECT_FALSE(matches_checked_output(object, requests, candidate)) << offset;
   }
   std::vector<uint8_t> unknown = image;
-  Elf64_Ehdr header{};
+  Elf64_Ehdr header = {};
   std::memcpy(&header, unknown.data(), sizeof(header));
   header.e_flags = EF_AMDGPU_MACH_NONE;
   std::memcpy(unknown.data(), &header, sizeof(header));
@@ -345,7 +338,7 @@ TEST(CheckedTextEdits, RejectsRelocationWritesAndInteriorSymbolEndpoints) {
     const CodeObjectPatcher patcher(original);
     const std::vector<Elf64_Shdr> sections = patcher.section_headers();
     const Section &text = *original.text_sections().front();
-    Elf64_Ehdr header{};
+    Elf64_Ehdr header = {};
     std::memcpy(&header, image.data(), sizeof(header));
     for (size_t index = 0; index < sections.size(); ++index) {
       const Elf64_Shdr &section = sections[index];
@@ -359,14 +352,14 @@ TEST(CheckedTextEdits, RejectsRelocationWritesAndInteriorSymbolEndpoints) {
         relocation.sh_link = index;
         relocation.sh_entsize = sizeof(Elf64_Rela);
         relocation.sh_size = sizeof(Elf64_Rela);
-        Elf64_Rela record{};
+        Elf64_Rela record = {};
         record.r_offset = text.vaddr() + 20;
         record.r_info = R_AMDGPU_ABS64;
         std::memcpy(image.data() + relocation.sh_offset, &record, sizeof(record));
         std::memcpy(image.data() + header.e_shoff + 2 * sizeof(Elf64_Shdr), &relocation,
                     sizeof(relocation));
       } else {
-        Elf64_Sym symbol{};
+        Elf64_Sym symbol = {};
         std::memcpy(&symbol, image.data() + section.sh_offset + sizeof(symbol), sizeof(symbol));
         symbol.st_shndx = *text.sectionHeaderIndex();
         symbol.st_info = elf_symbol_info(kElfSymbolBindLocal, kElfSymbolTypeFunc);
@@ -391,9 +384,9 @@ TEST(CheckedTextEdits, RejectsRelocationWritesAndInteriorSymbolEndpoints) {
 
 TEST(CheckedTextEdits, PreservesAdditionalExecutableSection) {
   std::vector<uint8_t> image = make_mixed_width_kernel_elf();
-  Elf64_Ehdr header{};
+  Elf64_Ehdr header = {};
   std::memcpy(&header, image.data(), sizeof(header));
-  Elf64_Shdr section{};
+  Elf64_Shdr section = {};
   const size_t offset = header.e_shoff + 2 * sizeof(section);
   std::memcpy(&section, image.data() + offset, sizeof(section));
   section.sh_flags |= SHF_EXECINSTR;
@@ -410,9 +403,9 @@ TEST(CheckedTextEdits, PreservesAdditionalExecutableSection) {
     std::memcpy(expected.data() + result.value().section.file_offset + edit.offset,
                 edit.replacement.data(), edit.replacement.size());
   EXPECT_EQ(result.value().image, expected);
-  EXPECT_TRUE(matches_checked_output(object, requests, expected, error).succeeded());
+  EXPECT_TRUE(matches_checked_output(object, requests, expected));
   expected[section.sh_offset] ^= 1;
-  EXPECT_TRUE(matches_checked_output(object, requests, expected, error).failed());
+  EXPECT_FALSE(matches_checked_output(object, requests, expected));
 }
 
 TEST(CheckedTextEdits, RejectsAliasedSections) {
@@ -428,7 +421,7 @@ TEST(CheckedTextEdits, RejectsAliasedSections) {
     } else {
       section.sh_addr = original.text_sections().front()->vaddr();
     }
-    Elf64_Ehdr header{};
+    Elf64_Ehdr header = {};
     std::memcpy(&header, image.data(), sizeof(header));
     std::memcpy(image.data() + header.e_shoff + 2 * sizeof(Elf64_Shdr), &section, sizeof(section));
     const AmdGpuCodeObject object(image.data(), image.size());
@@ -447,9 +440,9 @@ TEST(CheckedTextEdits, StreamingScanDistinguishesGfx1250ZeroLiteralFromPadding) 
                                    3, EF_AMDGPU_MACH_AMDGCN_GFX1250);
   const AmdGpuCodeObject object(image.data(), image.size());
   const uint32_t nop = build_s_nop(0, ROCJITSU_CODE_ARCH_CDNA5);
-  CheckedTextEdit edit{.offset = 0,
-                       .expected = make_instruction_bytes({0xbe8000ffu, 0}),
-                       .replacement = make_instruction_bytes({nop, nop})};
+  CheckedTextEdit edit = {.offset = 0,
+                          .expected = make_instruction_bytes({0xbe8000ffu, 0}),
+                          .replacement = make_instruction_bytes({nop, nop})};
   TextEditError error;
   EXPECT_TRUE(apply_checked_text_edits(object, std::span(&edit, 1), error).succeeded())
       << error.message;
@@ -465,9 +458,9 @@ TEST(CheckedTextEdits, RejectsBranchReferenceIntoReplacedLiteral) {
       {build_s_branch(1, kArch), 0xbe8000ffu, 0x12345678u, build_s_endpgm(kArch)}, 0);
   const AmdGpuCodeObject object(image.data(), image.size());
   const uint32_t nop = build_s_nop(0, kArch);
-  const CheckedTextEdit edit{.offset = 4,
-                             .expected = make_instruction_bytes({0xbe8000ffu, 0x12345678u}),
-                             .replacement = make_instruction_bytes({nop, nop})};
+  const CheckedTextEdit edit = {.offset = 4,
+                                .expected = make_instruction_bytes({0xbe8000ffu, 0x12345678u}),
+                                .replacement = make_instruction_bytes({nop, nop})};
   TextEditError error;
   EXPECT_TRUE(apply_checked_text_edits(object, std::span(&edit, 1), error).failed());
   EXPECT_EQ(error.code, TextEditErrorCode::UnsupportedReferences) << error.message;

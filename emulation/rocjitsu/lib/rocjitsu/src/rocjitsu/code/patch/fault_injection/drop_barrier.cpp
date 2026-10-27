@@ -191,7 +191,7 @@ Result FaultMutationContext::analyze() const {
   const std::span<const uint8_t> image = this->image();
   const AmdGpuCodeObject &object = source();
   const rj_code_target_id_t target = object.target_id();
-  Elf64_Ehdr header{};
+  Elf64_Ehdr header = {};
   if (image.size() < sizeof(header))
     return reject(error, FaultMutationErrorCode::UnsupportedForm, "truncated ELF header");
   std::memcpy(&header, image.data(), sizeof(header));
@@ -354,9 +354,9 @@ Result FaultMutationContext::analyze() const {
     BasicBlock *root = block_for_offset(index, owner.entry_text_offset);
     if (!root || root->start_offset() != owner.entry_text_offset)
       return reject(error, FaultMutationErrorCode::UnsupportedForm, "entry is not a block start");
-    const KernelScopeSpec scope_spec{.kernel_entries = all_entries,
-                                     .own_entries = {owner.entry_text_offset},
-                                     .address_taken_entries = {}};
+    const KernelScopeSpec scope_spec = {.kernel_entries = all_entries,
+                                        .own_entries = {owner.entry_text_offset},
+                                        .address_taken_entries = {}};
     std::vector<BasicBlock *> scope =
         reachable_kernel_blocks(blocks.value(), index, positions, *root, scope_spec);
     for (BasicBlock *block : scope) {
@@ -486,9 +486,9 @@ FailureOr<DropBarrierResult> apply_drop_barrier(const FaultMutationContext &cont
   assert(target && context.state_->edits);
   const uint32_t nop = build_s_nop(0, target->architecture_id);
   for (const StaticBarrierMember &member : barrier.members) {
-    CheckedTextEdit edit{.offset = member.offset,
-                         .expected = member.bytes,
-                         .replacement = std::vector<uint8_t>(member.bytes.size())};
+    CheckedTextEdit edit = {.offset = member.offset,
+                            .expected = member.bytes,
+                            .replacement = std::vector<uint8_t>(member.bytes.size())};
     std::memcpy(edit.replacement.data(), &nop, sizeof(nop));
     edits.push_back(std::move(edit));
   }

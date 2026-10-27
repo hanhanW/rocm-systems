@@ -111,7 +111,7 @@ std::vector<uint8_t> make_gfx1250_two_kernel_barrier_elf(
   std::copy(first.begin(), first.end(), words.begin());
   words.insert(words.end(), second.begin(), second.end());
   std::vector<uint8_t> image = test::make_gfx950_two_kernel_elf(words, 0);
-  Elf64_Ehdr header{};
+  Elf64_Ehdr header = {};
   std::memcpy(&header, image.data(), sizeof(header));
   header.e_ident[EI_DATA] = ELFDATA2LSB;
   header.e_ident[EI_ABIVERSION] = ELFABIVERSION_AMDGPU_HSA_V5;
@@ -183,7 +183,7 @@ std::vector<uint8_t> make_barrier_elf_for_target(const DropTargetRow &row,
   std::vector<uint8_t> image =
       siblings ? test::make_gfx950_two_kernel_elf(words, 0)
                : test::make_amdgpu_kernel_elf(words, 0, 3, binding->elf_machine);
-  Elf64_Ehdr header{};
+  Elf64_Ehdr header = {};
   std::memcpy(&header, image.data(), sizeof(header));
   header.e_ident[EI_DATA] = ELFDATA2LSB;
   header.e_ident[EI_ABIVERSION] = ELFABIVERSION_AMDGPU_HSA_V5;
@@ -398,9 +398,9 @@ TEST_P(FaultDropBarrierFamily, ExactSiblingSelectionAndCandidateCorruption) {
 TEST_P(FaultDropBarrierFamily, PreservesAdditionalExecutableSection) {
   const DropTargetRow &row = GetParam();
   std::vector<uint8_t> image = make_barrier_elf_for_target(row, make_barrier_words(row));
-  Elf64_Ehdr header{};
+  Elf64_Ehdr header = {};
   std::memcpy(&header, image.data(), sizeof(header));
-  Elf64_Shdr section{};
+  Elf64_Shdr section = {};
   const size_t offset = header.e_shoff + 2 * sizeof(section);
   std::memcpy(&section, image.data() + offset, sizeof(section));
   section.sh_flags |= SHF_EXECINSTR;
@@ -570,7 +570,7 @@ TEST(FaultDropBarrier, RejectsFamiliesWithoutCompleteDropPolicyAndUnregisteredTa
         EF_AMDGPU_MACH_AMDGCN_GFX941, EF_AMDGPU_MACH_AMDGCN_GFX1010, EF_AMDGPU_MACH_AMDGCN_GFX1030,
         EF_AMDGPU_MACH_AMDGCN_GFX1150, uint32_t{0xfe}}) {
     std::vector<uint8_t> image = make_gfx1250_barrier_elf();
-    Elf64_Ehdr header{};
+    Elf64_Ehdr header = {};
     std::memcpy(&header, image.data(), sizeof(header));
     header.e_flags = machine;
     std::memcpy(image.data(), &header, sizeof(header));
@@ -599,8 +599,8 @@ TEST_P(FaultDropBarrierRdna3, GoldenEncodingsAndExactDeltaPreserveDescriptor) {
   // s_barrier is SOPP 61; CDNA's SOPP 10 is s_wait_idle on this target.
   constexpr uint32_t nop = 0xbf800000u;
   EXPECT_EQ(build_s_nop(0, row.arch), nop);
-  constexpr std::array<std::string_view, 6> mnemonics{"s_waitcnt", "s_barrier", "s_mov_b32",
-                                                      "s_waitcnt", "s_barrier", "s_endpgm"};
+  constexpr std::array<std::string_view, 6> mnemonics = {"s_waitcnt", "s_barrier", "s_mov_b32",
+                                                         "s_waitcnt", "s_barrier", "s_endpgm"};
   ASSERT_EQ(words.size(), mnemonics.size());
   for (size_t index = 0; index < words.size(); ++index) {
     DecodeResult instruction = decoder->decode_window(std::span(words).subspan(index), index * 4);
@@ -663,7 +663,7 @@ TEST_P(FaultDropBarrierRdna3, GoldenEncodingsAndExactDeltaPreserveDescriptor) {
 
 TEST_P(FaultDropBarrierRdna3, CdnaBarrierEncodingIsAnOrdinaryWait) {
   const DropTargetRow &row = GetParam();
-  const std::array<uint32_t, 1> words{0xbf8a0000u};
+  const std::array<uint32_t, 1> words = {0xbf8a0000u};
   std::unique_ptr<Decoder> decoder = Decoder::create(default_isa_target_registry(), row.target);
   ASSERT_TRUE(decoder);
   DecodeResult instruction = decoder->decode_window(words, 0);
@@ -708,7 +708,7 @@ TEST_P(FaultDropBarrierRdna3, SelectionCannotReplayChangedWaveEntryOrTarget) {
   for (int mode = 0; mode < 3; ++mode) {
     SCOPED_TRACE(mode);
     std::vector<uint8_t> changed = image;
-    amdhsa::kernel_descriptor_t descriptor{};
+    amdhsa::kernel_descriptor_t descriptor = {};
     const uint64_t offset = inventory.value().owner().descriptor_file_offset;
     std::memcpy(&descriptor, changed.data() + offset, sizeof(descriptor));
     if (mode == 0)
@@ -716,7 +716,7 @@ TEST_P(FaultDropBarrierRdna3, SelectionCannotReplayChangedWaveEntryOrTarget) {
     else if (mode == 1)
       descriptor.kernel_code_entry_byte_offset += 4;
     else {
-      Elf64_Ehdr header{};
+      Elf64_Ehdr header = {};
       std::memcpy(&header, changed.data(), sizeof(header));
       header.e_flags = EF_AMDGPU_MACH_AMDGCN_GFX1200;
       std::memcpy(changed.data(), &header, sizeof(header));
@@ -882,7 +882,7 @@ TEST(FaultDropBarrier, ExactSelectionRejectsDuplicateNamesAndSiblingOwnerSubstit
   for (const Elf64_Shdr &section : patcher.section_headers()) {
     if (section.sh_type != SHT_SYMTAB)
       continue;
-    Elf64_Sym first_symbol{}, second_symbol{};
+    Elf64_Sym first_symbol = {}, second_symbol = {};
     std::memcpy(&first_symbol, image.data() + section.sh_offset + sizeof(Elf64_Sym),
                 sizeof(first_symbol));
     std::memcpy(&second_symbol, image.data() + section.sh_offset + 2 * sizeof(Elf64_Sym),
@@ -932,7 +932,7 @@ TEST(FaultDropBarrier, IndependentSiblingMalformedDescriptorCannotDisappearFromO
   for (const Elf64_Shdr &section : patcher.section_headers()) {
     if (section.sh_type != SHT_SYMTAB)
       continue;
-    Elf64_Sym symbol{};
+    Elf64_Sym symbol = {};
     const uint64_t offset = section.sh_offset + 2 * sizeof(symbol);
     std::memcpy(&symbol, image.data() + offset, sizeof(symbol));
     symbol.st_size = 0;
@@ -948,7 +948,7 @@ TEST(FaultDropBarrier, PreservesUnselectedSectionButRejectsActualTextRelocations
   const std::vector<uint8_t> original = make_gfx1250_two_kernel_barrier_elf();
   const AmdGpuCodeObject source(original.data(), original.size());
   CodeObjectPatcher patcher(source);
-  Elf64_Rela relocation{};
+  Elf64_Rela relocation = {};
   relocation.r_offset = source.text_sections().front()->vaddr();
   relocation.r_info = R_AMDGPU_ABS64;
   const auto payload =
@@ -977,7 +977,7 @@ TEST(FaultDropBarrier, PreservesUnselectedSectionButRejectsActualTextRelocations
   for (size_t index = 0; index < sections.size(); ++index)
     if (sections[index].sh_type == SHT_SYMTAB)
       extra.sh_link = index;
-  Elf64_Ehdr header{};
+  Elf64_Ehdr header = {};
   std::memcpy(&header, image.data(), sizeof(header));
   std::memcpy(image.data() + header.e_shoff + (sections.size() - 1) * sizeof(extra), &extra,
               sizeof(extra));
@@ -991,9 +991,9 @@ TEST(FaultDropBarrier, RejectsDeclaredExecutableOwnerOutsideAnalyzedText) {
   const AmdGpuCodeObject source(original.data(), original.size());
   CodeObjectPatcher patcher(source);
   const size_t code_index = patcher.section_headers().size();
-  const std::array<uint32_t, 2> words{build_s_nop(0, kArch), build_s_endpgm(kArch)};
-  const std::array<uint8_t, 7> names{0, 'e', 'x', 't', 'r', 'a', 0};
-  std::array<Elf64_Sym, 2> symbols{};
+  const std::array<uint32_t, 2> words = {build_s_nop(0, kArch), build_s_endpgm(kArch)};
+  const std::array<uint8_t, 7> names = {0, 'e', 'x', 't', 'r', 'a', 0};
+  std::array<Elf64_Sym, 2> symbols = {};
   symbols[1].st_name = 1;
   symbols[1].st_info = (kElfSymbolBindGlobal << 4) | kElfSymbolTypeFunc;
   symbols[1].st_shndx = static_cast<uint16_t>(code_index);
@@ -1015,7 +1015,7 @@ TEST(FaultDropBarrier, RejectsDeclaredExecutableOwnerOutsideAnalyzedText) {
   symtab.sh_link = static_cast<uint32_t>(code_index + 1);
   symtab.sh_info = 1;
   std::vector<uint8_t> image = patcher.emit();
-  Elf64_Ehdr header{};
+  Elf64_Ehdr header = {};
   std::memcpy(&header, image.data(), sizeof(header));
   std::memcpy(image.data() + header.e_shoff, sections.data(), sections.size() * sizeof(Elf64_Shdr));
   const FaultMutationContext context(image);
@@ -1023,7 +1023,7 @@ TEST(FaultDropBarrier, RejectsDeclaredExecutableOwnerOutsideAnalyzedText) {
   ASSERT_EQ(context.source().allocated_executable_sections().size(), 2u);
   // The section transaction can preserve this layout without proving its owners.
   const Section &text = *context.source().text_sections().front();
-  CheckedTextEdit edit{
+  CheckedTextEdit edit = {
       .offset = 0, .expected = std::vector<uint8_t>(4), .replacement = std::vector<uint8_t>(4)};
   std::memcpy(edit.expected.data(), text.data(), 4);
   std::memcpy(edit.replacement.data(), words.data(), 4);
@@ -1050,7 +1050,7 @@ TEST(FaultDropBarrier, MultiTextHasAnExplicitDiagnostic) {
   Elf64_Shdr &extra = sections.back();
   extra.sh_flags = SHF_ALLOC | SHF_EXECINSTR;
   extra.sh_addr = 0x4000;
-  Elf64_Ehdr header{};
+  Elf64_Ehdr header = {};
   std::memcpy(&header, multiple.data(), sizeof(header));
   std::memcpy(multiple.data() + header.e_shoff + (sections.size() - 1) * sizeof(extra), &extra,
               sizeof(extra));
@@ -1081,11 +1081,11 @@ TEST(FaultDropBarrier, LongSameBlockPairUsesCompleteMembersWithoutDistanceCutoff
 }
 
 template <typename Edit> void edit_segment(std::vector<uint8_t> &image, size_t index, Edit edit) {
-  Elf64_Ehdr header{};
+  Elf64_Ehdr header = {};
   std::memcpy(&header, image.data(), sizeof(header));
   const size_t offset = header.e_phoff + index * sizeof(Elf64_Phdr);
   ASSERT_LE(offset + sizeof(Elf64_Phdr), image.size());
-  Elf64_Phdr segment{};
+  Elf64_Phdr segment = {};
   std::memcpy(&segment, image.data() + offset, sizeof(segment));
   edit(segment);
   std::memcpy(image.data() + offset, &segment, sizeof(segment));
@@ -1171,9 +1171,9 @@ TEST(FaultDropBarrier, RejectsOverlappingLoadMappings) {
       SCOPED_TRACE(index);
       SCOPED_TRACE(zero_fill);
       std::vector<uint8_t> image = make_gfx1250_barrier_elf();
-      Elf64_Ehdr header{};
+      Elf64_Ehdr header = {};
       std::memcpy(&header, image.data(), sizeof(header));
-      Elf64_Phdr overlap{};
+      Elf64_Phdr overlap = {};
       std::memcpy(&overlap, image.data() + header.e_phoff + index * sizeof(overlap),
                   sizeof(overlap));
       overlap.p_vaddr += 4;
@@ -1325,14 +1325,14 @@ TEST(FaultDropBarrier, RejectsMissingDuplicateStaleHalfWrongOwnerAndQualificatio
 }
 
 TEST(FaultDropBarrier, RejectsPartialInterleavedDynamicAndNamedLifecycle) {
-  const std::vector<std::vector<uint32_t>> cases{{kSignal, kEnd},
-                                                 {kWait, kEnd},
-                                                 {kSignal, kSignal, kWait, kEnd},
-                                                 {kSignal, 0xbf94fffeu, kEnd},
-                                                 {0xbe804e7du, kWait, kEnd},
-                                                 {0xbe804e81u, 0xbf940001u, kEnd},
-                                                 {0xbe804fc1u, kWait, kEnd},
-                                                 {kSignal, 0xbe8050c1u, kWait, kEnd}};
+  const std::vector<std::vector<uint32_t>> cases = {{kSignal, kEnd},
+                                                    {kWait, kEnd},
+                                                    {kSignal, kSignal, kWait, kEnd},
+                                                    {kSignal, 0xbf94fffeu, kEnd},
+                                                    {0xbe804e7du, kWait, kEnd},
+                                                    {0xbe804e81u, 0xbf940001u, kEnd},
+                                                    {0xbe804fc1u, kWait, kEnd},
+                                                    {kSignal, 0xbe8050c1u, kWait, kEnd}};
   for (const std::vector<uint32_t> &words : cases) {
     const std::vector<uint8_t> image = make_gfx1250_barrier_elf(words);
     const FaultMutationContext context(image);
@@ -1388,7 +1388,7 @@ TEST(FaultDropBarrier, RejectsForeignHeadersAndNonexactEntry) {
   EXPECT_TRUE(discover_drop_barriers(context, "kernel", error).failed());
   EXPECT_EQ(error.code, FaultMutationErrorCode::BadIdentity);
   std::vector<uint8_t> foreign = original;
-  Elf64_Ehdr header{};
+  Elf64_Ehdr header = {};
   std::memcpy(&header, foreign.data(), sizeof(header));
   header.e_flags = EF_AMDGPU_MACH_AMDGCN_GFX90A;
   std::memcpy(foreign.data(), &header, sizeof(header));
@@ -1430,7 +1430,7 @@ TEST(FaultDropBarrier, CapabilityDescribesTransformationOnly) {
               row.split ? StaticBarrierForm::BuiltinSplitPair : StaticBarrierForm::FullSingleton);
     EXPECT_FALSE(match->admission.empty());
   }
-  constexpr std::array<IsaTargetDescriptor, 0> providers{};
+  constexpr std::array<IsaTargetDescriptor, 0> providers = {};
   const IsaTargetRegistry missing(providers);
   EXPECT_TRUE(fault_mutation_capabilities(missing).empty());
   EXPECT_FALSE(static_barrier_policy(kTarget, missing));
@@ -1462,7 +1462,7 @@ TEST(FaultDropBarrier, BuiltinIdsKeepDistinctStaticScopes) {
 TEST(FaultDropBarrier, RejectsAliasedEntryOwnersAndMalformedOmittedDescriptor) {
   for (const bool malformed : {false, true}) {
     std::vector<uint8_t> image = test::make_gfx950_two_kernel_elf({kSignal, kWait, kEnd}, 0);
-    Elf64_Ehdr header{};
+    Elf64_Ehdr header = {};
     std::memcpy(&header, image.data(), sizeof(header));
     header.e_ident[EI_DATA] = ELFDATA2LSB;
     header.e_ident[EI_ABIVERSION] = ELFABIVERSION_AMDGPU_HSA_V5;
@@ -1474,12 +1474,12 @@ TEST(FaultDropBarrier, RejectsAliasedEntryOwnersAndMalformedOmittedDescriptor) {
       if (section.sh_type != SHT_SYMTAB)
         continue;
       for (size_t ordinal = 1; ordinal <= 2; ++ordinal) {
-        Elf64_Sym symbol{};
+        Elf64_Sym symbol = {};
         std::memcpy(&symbol, image.data() + section.sh_offset + ordinal * sizeof(symbol),
                     sizeof(symbol));
         // Both descriptors belong to the .rodata section.
         const Elf64_Shdr owner = patcher.section_headers()[symbol.st_shndx];
-        amdhsa::kernel_descriptor_t descriptor{};
+        amdhsa::kernel_descriptor_t descriptor = {};
         const size_t offset = owner.sh_offset + symbol.st_value - owner.sh_addr;
         std::memcpy(&descriptor, image.data() + offset, sizeof(descriptor));
         descriptor.kernel_code_properties |= amdhsa::KERNEL_CODE_PROPERTY_ENABLE_WAVEFRONT_SIZE32;

@@ -25,8 +25,8 @@ Result reject(StaticBarrierError &error, StaticBarrierErrorCode code, uint64_t o
   return Result::failure();
 }
 StaticBarrierMember make_barrier_member(const Instruction &instruction) {
-  StaticBarrierMember result{.offset = instruction.src_loc(),
-                             .bytes = std::vector<uint8_t>(instruction.size())};
+  StaticBarrierMember result = {.offset = instruction.src_loc(),
+                                .bytes = std::vector<uint8_t>(instruction.size())};
   std::memcpy(result.bytes.data(), instruction.raw_encoding(), result.bytes.size());
   return result;
 }
@@ -37,9 +37,9 @@ std::optional<StaticBarrierPolicy> static_barrier_policy(rj_code_target_id_t tar
   const IsaTargetDescriptor *family = registry.find(target);
   if (!family || !registry.find_gpu_target(target))
     return std::nullopt;
-  static constexpr std::array<uint32_t, 2> rdna_waves{32, 64};
-  static constexpr std::array<uint32_t, 1> wave32{32};
-  static constexpr std::array<uint32_t, 1> wave64{64};
+  static constexpr std::array<uint32_t, 2> rdna_waves = {32, 64};
+  static constexpr std::array<uint32_t, 1> wave32 = {32};
+  static constexpr std::array<uint32_t, 1> wave64 = {64};
   switch (family->architecture_id) {
   case ROCJITSU_CODE_ARCH_RDNA3:
     return StaticBarrierPolicy{.form = StaticBarrierForm::FullSingleton,
