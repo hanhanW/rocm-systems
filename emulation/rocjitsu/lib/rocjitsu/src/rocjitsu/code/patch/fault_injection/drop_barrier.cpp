@@ -135,12 +135,10 @@ FailureOr<DropBarrierSelection> select_drop_barrier(const FaultBarrierInventory 
   const std::shared_ptr<const FaultBarrierRecord> &record = inventory.record_;
   if (!record || record->source.expired())
     return reject(error, FaultMutationErrorCode::BadIdentity, "expired or unbound inventory");
-  // clang-format off
-  // TODO(hanchung): Add a better barrier-selection heuristic while preserving explicit selection and reproducibility.
-  // clang-format on
-  // Currently, an exact selection takes precedence; otherwise we use the requested
-  // zero-based logical ordinal in first-member source order, defaulting to zero.
-  // Repeated default requests choose the same barrier; no race scoring is used.
+  // TODO(hanchung): Add a better barrier-selection heuristic while preserving explicit selection
+  // and reproducibility. Currently, an exact selection takes precedence; otherwise we use the
+  // requested zero-based logical ordinal in first-member source order, defaulting to zero. Repeated
+  // default requests choose the same barrier; no race scoring is used.
   if (selector.exact) {
     if (selector.exact->record_.lock() != record)
       return reject(error, FaultMutationErrorCode::BadIdentity,
